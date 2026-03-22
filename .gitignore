@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+.env.local
+
+# 敏感配置（API Key）
+FinReport2Video/.env
+OpenMAIC/.env
+OpenMAIC/.env.local
+**/.env.local
+
+# 临时文件 / 生成产物
+FinReport2Video/temp/
+FinReport2Video/output/
+FinReport2Video/input/
+
+# Node.js
+node_modules/
+.next/
+.turbo/
+*.tsbuildinfo
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 日志
+*.log
+logs/
+
+# Qoder IDE 缓存（保留 agents/skills 配置）
+.qoder/cache/

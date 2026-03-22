@@ -1,0 +1,3 @@
+[submodule "OpenMAIC"]
+	path = OpenMAIC
+	url = git@github.com:THU-MAIC/OpenMAIC.git
