@@ -12,6 +12,8 @@
   全屏背景视频 + 标题 + 摘要 + 分析师/日期信息
 """
 import os
+import subprocess
+import tempfile
 from typing import List, Optional, Dict
 
 import numpy as np
@@ -92,24 +94,27 @@ def compose_page_clip(
     else:
         layers.append(_make_fallback_bg(duration))
 
-    # 2. 顶部章节标题栏
+    # 2/3/5. 静态层合并：标题栏 + 左侧信息卡 + 底部字幕轻遇罩合并为一张 RGBA 底图
+    # 避免 3 个独立层在合成时逐帧做 alpha 混合
     title_bar_arr = _make_title_bar(page_title)
-    layers.append(VideoClip(lambda t, a=title_bar_arr: a, duration=duration, is_mask=False))
-
-    # 3. 左侧文字信息（融合风格，无遮罩）+ 左侧上方展示截图/表格
-    card_arr = _make_info_card(page_num, page_title, key_points or [], screenshot_path)
-    layers.append(VideoClip(lambda t, a=card_arr: a, duration=duration, is_mask=False))
+    card_arr      = _make_info_card(page_num, page_title, key_points or [], screenshot_path)
+    static_base   = Image.new("RGBA", (VW, VH), (0, 0, 0, 0))
+    # 底部字幕轻遇罩
+    sub_overlay_img = Image.new("RGBA", (VW, VH), (0, 0, 0, 0))
+    sub_overlay_img.paste((0, 0, 0, 55),
+                          box=(0, SUB_Y0 - 20, VW, VH))
+    static_base = Image.alpha_composite(static_base, sub_overlay_img)
+    # 标题栏和信息卡叠加
+    static_base = Image.alpha_composite(static_base, Image.fromarray(title_bar_arr))
+    static_base = Image.alpha_composite(static_base, Image.fromarray(card_arr))
+    static_arr  = np.array(static_base)
+    layers.append(VideoClip(lambda t, a=static_arr: a, duration=duration, is_mask=False))
 
     # 4. 右侧图表（滑入 + 轮播）
     if image_paths:
         chart_clip = _make_chart_clip(image_paths, duration)
         if chart_clip:
             layers.append(chart_clip)
-
-    # 5. 底部字幕轻遮罩（仅轻微渐变，不遮挡视频）
-    sub_overlay = np.zeros((VH, VW, 4), dtype=np.uint8)
-    sub_overlay[SUB_Y0 - 20:VH, :] = [0, 0, 0, 55]
-    layers.append(VideoClip(lambda t, a=sub_overlay: a, duration=duration, is_mask=False))
 
     # 6. 底部打字字幕（核心动效）
     sub_clip = _make_subtitle_clip(script_text, duration, word_timestamps or [])
@@ -175,16 +180,87 @@ def compose_intro_clip(
     return video
 
 
+def _concatenate_with_ffmpeg(clips: list, output_path: str) -> str:
+    """
+    使用 FFmpeg 直接拼接视频片段，不重新编码。
+    要求所有片段格式完全一致（分辨率、编码、帧率）。
+    返回输出文件路径。
+    """
+    # 创建临时目录存储片段文件列表
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # 保存所有片段为临时文件
+        clip_paths = []
+        for i, clip in enumerate(clips):
+            clip_path = os.path.join(tmpdir, f"clip_{i:03d}.mp4")
+            # 如果 clip 已经是文件路径，直接使用
+            if isinstance(clip, str) and os.path.exists(clip):
+                clip_paths.append(clip)
+            else:
+                # 否则写入临时文件
+                clip.write_videofile(
+                    clip_path,
+                    fps=VIDEO_FPS,
+                    codec="libx264",
+                    audio_codec="aac",
+                    preset="ultrafast",
+                    logger=None,
+                )
+                clip_paths.append(clip_path)
+
+        # 创建 FFmpeg concat 文件列表
+        list_file = os.path.join(tmpdir, "filelist.txt")
+        with open(list_file, "w", encoding="utf-8") as f:
+            for path in clip_paths:
+                # 转义单引号
+                escaped = path.replace("'", "'\\''")
+                f.write(f"file '{escaped}'\n")
+
+        # 调用 FFmpeg 拼接（不重新编码）
+        cmd = [
+            "ffmpeg",
+            "-y",  # 覆盖输出
+            "-f", "concat",
+            "-safe", "0",
+            "-i", list_file,
+            "-c", "copy",  # 复制流，不重新编码
+            "-movflags", "+faststart",  # 优化网络播放
+            output_path,
+        ]
+
+        print(f"  FFmpeg 拼接 {len(clips)} 个片段...")
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"FFmpeg 拼接失败: {result.stderr}")
+
+    return output_path
+
+
 def compose_final_video(clips: list, output_path: str, crossfade: float = 0.5):
     """
-    合并所有片段，片段之间加交叉淡化过渡。
-    crossfade: 过渡时长（秒），默认 0.5s
+    合并所有片段。
+    默认使用 FFmpeg 直接拼接（最快），不支持转场。
+    如需转场效果，设置 crossfade > 0 使用 moviepy 渲染。
     """
-    print(f"\n合并 {len(clips)} 个片段（交叉淡化 {crossfade}s），输出到: {output_path}")
-    if len(clips) <= 1 or crossfade <= 0:
+    print(f"\n合并 {len(clips)} 个片段，输出到: {output_path}")
+
+    # 如果不需要转场，使用 FFmpeg 快速拼接
+    if crossfade <= 0 or len(clips) <= 1:
+        try:
+            _concatenate_with_ffmpeg(clips, output_path)
+            print(f"视频已保存: {output_path}")
+            return
+        except Exception as e:
+            print(f"  FFmpeg 拼接失败，回退到 moviepy: {e}")
+
+    # 使用 moviepy 渲染（支持转场，但更慢）
+    if len(clips) <= 1:
         final = concatenate_videoclips(clips, method="compose")
     else:
-        # 使用 crossfadein/crossfadeout 实现片段间平滑过渡
         faded = [clips[0].with_effects([vfx.CrossFadeOut(crossfade)])]
         for clip in clips[1:-1]:
             faded.append(
@@ -193,6 +269,7 @@ def compose_final_video(clips: list, output_path: str, crossfade: float = 0.5):
         if len(clips) > 1:
             faded.append(clips[-1].with_effects([vfx.CrossFadeIn(crossfade)]))
         final = concatenate_videoclips(faded, method="compose", padding=-crossfade)
+
     final.write_videofile(
         output_path,
         fps=VIDEO_FPS,
@@ -201,7 +278,7 @@ def compose_final_video(clips: list, output_path: str, crossfade: float = 0.5):
         temp_audiofile=output_path + ".temp_audio.m4a",
         remove_temp=True,
         threads=4,
-        preset="fast",
+        preset="ultrafast",
         logger=None,
     )
     print(f"视频已保存: {output_path}")
@@ -435,19 +512,36 @@ def _make_subtitle_clip(script_text: str, duration: float, words_ts: List[Dict])
     - 无背景框，纯文字 + 阴影
     """
     font = _get_font(SUB_FONT_SIZE)
-    font_shadow = _get_font(SUB_FONT_SIZE)
+    font_prev = _get_font(SUB_FONT_SIZE - 6)   # 上一行字体，提前缓存，避免每帧调用
 
     lines = _build_subtitle_lines(words_ts, script_text, duration)
     if not lines:
         return VideoClip(lambda t: np.zeros((VH, VW, 4), dtype=np.uint8),
                          duration=duration, is_mask=False)
 
+    # 预计算每行每个字的宽度（字和字体不变，无需每帧重算）
+    # 需要临时 draw 对象来测量文字宽度
+    _tmp_img = Image.new("RGBA", (10, 10), (0, 0, 0, 0))
+    _tmp_draw = ImageDraw.Draw(_tmp_img)
+
+    def _calc_widths(line_words, fnt):
+        ws = []
+        for w in line_words:
+            try:
+                bbox = _tmp_draw.textbbox((0, 0), w["word"], font=fnt)
+                ws.append(bbox[2] - bbox[0] + 4)
+            except Exception:
+                ws.append(SUB_FONT_SIZE + 4)
+        return ws
+
+    line_widths      = [_calc_widths(l, font)      for l in lines]   # 当前行字宽
+    line_widths_prev = [_calc_widths(l, font_prev) for l in lines]   # 上一行字宽
+
     # 预计算每行的时间范围
     def line_range(line):
-        all_w = line
-        if not all_w:
+        if not line:
             return 0, duration
-        return all_w[0]["start"], all_w[-1]["end"]
+        return line[0]["start"], line[-1]["end"]
 
     line_ranges = [line_range(l) for l in lines]
 
@@ -463,17 +557,19 @@ def _make_subtitle_clip(script_text: str, duration: float, words_ts: List[Dict])
 
         # 渲染当前行（居中）
         _draw_subtitle_line(draw, font, lines[cur_idx], t,
-                            y=SUB_Y0 + 55, center=True, show_all=True)
+                            y=SUB_Y0 + 55, center=True, show_all=True,
+                            precomputed_widths=line_widths[cur_idx])
 
         # 渲染上一行（已读，白色，稍小，稍暗）
         if cur_idx > 0:
             prev_line = lines[cur_idx - 1]
             prev_fade = max(0.0, 1.0 - (t - line_ranges[cur_idx - 1][1]) / 0.8)
             if prev_fade > 0.05:
-                _draw_subtitle_line(draw, _get_font(SUB_FONT_SIZE - 6), prev_line, t,
+                _draw_subtitle_line(draw, font_prev, prev_line, t,
                                     y=SUB_Y0 + 8, center=True,
                                     show_all=True, alpha_scale=prev_fade * 0.6,
-                                    force_color=COLOR_SUB_DONE)
+                                    force_color=COLOR_SUB_DONE,
+                                    precomputed_widths=line_widths_prev[cur_idx - 1])
 
         return np.array(canvas)
 
@@ -481,23 +577,25 @@ def _make_subtitle_clip(script_text: str, duration: float, words_ts: List[Dict])
 
 
 def _draw_subtitle_line(draw, font, line_words, t, y, center=True,
-                        show_all=False, alpha_scale=1.0, force_color=None):
-    """渲染一行字幕到 draw 对象"""
+                        show_all=False, alpha_scale=1.0, force_color=None,
+                        precomputed_widths=None):
+    """渲染一行字幕到 draw 对象；precomputed_widths 传入可跳过重算"""
     if not line_words:
         return
 
-    # 先计算总行宽
-    total_w = 0
-    widths = []
-    for w in line_words:
-        try:
-            bbox = draw.textbbox((0, 0), w["word"], font=font)
-            ww = bbox[2] - bbox[0] + 4
-        except Exception:
-            ww = SUB_FONT_SIZE + 4
-        widths.append(ww)
-        total_w += ww
+    # 使用预计算字宽，或实时计算
+    if precomputed_widths and len(precomputed_widths) == len(line_words):
+        widths = precomputed_widths
+    else:
+        widths = []
+        for w in line_words:
+            try:
+                bbox = draw.textbbox((0, 0), w["word"], font=font)
+                widths.append(bbox[2] - bbox[0] + 4)
+            except Exception:
+                widths.append(SUB_FONT_SIZE + 4)
 
+    total_w = sum(widths)
     x = (VW - total_w) // 2 if center else PAD
 
     for i, (w, ww) in enumerate(zip(line_words, widths)):
@@ -625,7 +723,8 @@ def _make_progress_bar(duration: float) -> VideoClip:
 # ── 片头页内容（淡入动画）─────────────────────────────────────────────────────
 
 def _make_intro_content(title, abstract, analyst, date, total_pages, duration, data_source="") -> VideoClip:
-    """片头内容：标题大字 + 分割线 + 摘要 + 底部信息栏，带淡入"""
+    """片头内容：标题大字 + 分割线 + 摘要 + 底部信息栏，带淡入动画。
+    预计算所有静态文字宽度，避免每帧重复调用 textbbox。"""
 
     font_title = _get_font(72)
     font_sub   = _get_font(34)
@@ -634,95 +733,90 @@ def _make_intro_content(title, abstract, analyst, date, total_pages, duration, d
 
     FADE_IN = 1.2   # 淡入时长
 
+    # ── 预计算所有静态内容宽度 ─────────────────────────────────────
+    _tmp = Image.new("RGBA", (10, 10), (0, 0, 0, 0))
+    _td  = ImageDraw.Draw(_tmp)
+
+    def _tw(text, font, fallback_size):
+        try:
+            b = _td.textbbox((0, 0), text, font=font)
+            return b[2] - b[0]
+        except Exception:
+            return len(text) * fallback_size
+
+    badge_text    = "金融报告深度解读"
+    badge_x       = VW // 2 - 130   # 固定位置
+
+    title_display = title if title else "金融分析报告"
+    if len(title_display) > 18:
+        mid    = len(title_display) // 2
+        lines  = [title_display[:mid], title_display[mid:]]
+    else:
+        lines  = [title_display]
+    line_tws = [_tw(l, font_title, 72) for l in lines]
+    line_txs = [(VW - tw) // 2 for tw in line_tws]
+
+    abs_text = (abstract[:60] + "…" if abstract and len(abstract) > 60 else abstract or "")
+    abs_tw   = _tw(abs_text, font_sub, 34) if abs_text else 0
+    abs_tx   = (VW - abs_tw) // 2
+
+    info_parts = []
+    if analyst:     info_parts.append(f"分析师：{analyst}")
+    if date:        info_parts.append(f"发布日期：{date}")
+    if total_pages: info_parts.append(f"共 {total_pages} 页")
+    info_str  = "    |    ".join(info_parts) if info_parts else "金融研究报告"
+    info_tw   = _tw(info_str, font_info, 28)
+    info_tx   = (VW - info_tw) // 2
+    info_y    = VH - 160
+
+    ds_text = f"数据来源：{data_source[:50]}" if data_source else ""
+    ds_tw   = _tw(ds_text, font_badge, 24) if ds_text else 0
+    ds_tx   = (VW - ds_tw) // 2
+
+    # y_title 起始 Y坐标（居中标题占 88px 每行）
+    title_y_start = 180
+    line_y = title_y_start + len(lines) * 88 + 10   # 分割线 Y
+
     def make_frame(t):
         canvas = Image.new("RGBA", (VW, VH), (0, 0, 0, 0))
         draw = ImageDraw.Draw(canvas)
 
-        fade = min(1.0, t / FADE_IN)
+        fade  = min(1.0, t / FADE_IN)
         alpha = int(255 * fade)
 
         # ── 顶部品牌标签 ──
-        badge_text = "金融报告深度解读"
         draw.rounded_rectangle([VW // 2 - 180, 80, VW // 2 + 180, 130],
                                 radius=8, fill=(200, 80, 15, int(alpha * 0.9)))
-        draw.text((VW // 2 - 130, 88), badge_text, fill=(255, 255, 255, alpha), font=font_badge)
+        draw.text((badge_x, 88), badge_text, fill=(255, 255, 255, alpha), font=font_badge)
 
-        # ── 主标题（居中，带描边）──
-        title_display = title if title else "金融分析报告"
-        # 自动换行（超过18字换行）
-        if len(title_display) > 18:
-            mid = len(title_display) // 2
-            line1 = title_display[:mid]
-            line2 = title_display[mid:]
-        else:
-            line1 = title_display
-            line2 = ""
-
-        y_title = 180
-        for txt_line in [line1, line2]:
-            if not txt_line:
-                continue
-            try:
-                bbox = draw.textbbox((0, 0), txt_line, font=font_title)
-                tw = bbox[2] - bbox[0]
-            except Exception:
-                tw = len(txt_line) * 72
-            tx = (VW - tw) // 2
-            # 描边
+        # ── 主标题 ──
+        y_title = title_y_start
+        for txt_line, tw, tx in zip(lines, line_tws, line_txs):
             for dx, dy in [(-2,-2),(2,-2),(-2,2),(2,2)]:
-                draw.text((tx+dx, y_title+dy), txt_line, fill=(0, 0, 0, int(alpha * 0.6)), font=font_title)
-            draw.text((tx, y_title), txt_line, fill=(255, 245, 220, alpha), font=font_title)
+                draw.text((tx+dx, y_title+dy), txt_line,
+                          fill=(0, 0, 0, int(alpha * 0.6)), font=font_title)
+            draw.text((tx, y_title), txt_line,
+                      fill=(255, 245, 220, alpha), font=font_title)
             y_title += 88
 
         # ── 橙色分割线 ──
-        line_y = y_title + 10
         draw.line([(VW // 2 - 300, line_y), (VW // 2 + 300, line_y)],
                   fill=(*COLOR_ACCENT[:3], alpha), width=3)
 
         # ── 摘要文字 ──
-        if abstract:
-            abs_text = abstract[:60] + ("…" if len(abstract) > 60 else "")
-            try:
-                bbox = draw.textbbox((0, 0), abs_text, font=font_sub)
-                tw = bbox[2] - bbox[0]
-            except Exception:
-                tw = len(abs_text) * 34
-            draw.text(((VW - tw) // 2, line_y + 30), abs_text,
+        if abs_text:
+            draw.text((abs_tx, line_y + 30), abs_text,
                       fill=(200, 215, 240, int(alpha * 0.9)), font=font_sub)
 
         # ── 底部信息栏 ──
-        info_y = VH - 160
-        # 信息栏背景
-        draw.rounded_rectangle([VW // 2 - 500, info_y - 10, VW // 2 + 500, info_y + 110],
+        draw.rounded_rectangle([VW // 2 - 500, info_y - 10,
+                                 VW // 2 + 500, info_y + 110],
                                 radius=12, fill=(20, 30, 70, int(alpha * 0.8)))
-
-        info_parts = []
-        if analyst:
-            info_parts.append(f"分析师：{analyst}")
-        if date:
-            info_parts.append(f"发布日期：{date}")
-        if total_pages:
-            info_parts.append(f"共 {total_pages} 页")
-
-        info_str = "    |    ".join(info_parts) if info_parts else "金融研究报告"
-
-        try:
-            bbox = draw.textbbox((0, 0), info_str, font=font_info)
-            tw = bbox[2] - bbox[0]
-        except Exception:
-            tw = len(info_str) * 28
-        draw.text(((VW - tw) // 2, info_y + 10), info_str,
+        draw.text((info_tx, info_y + 10), info_str,
                   fill=(200, 210, 240, int(alpha * 0.95)), font=font_info)
 
-        # 数据源行
-        if data_source:
-            ds_text = f"数据来源：{data_source[:50]}"
-            try:
-                bbox = draw.textbbox((0, 0), ds_text, font=font_badge)
-                tw = bbox[2] - bbox[0]
-            except Exception:
-                tw = len(ds_text) * 24
-            draw.text(((VW - tw) // 2, info_y + 55), ds_text,
+        if ds_text:
+            draw.text((ds_tx, info_y + 55), ds_text,
                       fill=(160, 180, 220, int(alpha * 0.8)), font=font_badge)
 
         return np.array(canvas)

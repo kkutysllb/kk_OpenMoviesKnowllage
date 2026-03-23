@@ -29,13 +29,14 @@ EDGE_TTS_VOICE = "zh-CN-XiaoxiaoNeural"  # 女声，清晰自然
 EDGE_TTS_RATE = "+5%"    # 语速稍快一点，金融播报感
 EDGE_TTS_VOLUME = "+0%"
 
-# 金融术语读音修正：在这些术语前后补充逗号，让 TTS 正确断句
-_FUTURES_TERMS = (
-    r"空头|多头|期指|期货|持仓|减仓|开仓|平仓|基差|升水|贴水|连续平仓|政策面|资金面"
-)
-_FUTURES_TERMS_RE = re.compile(
-    rf'([\u4e00-\u9fff\w])({_FUTURES_TERMS})([\u4e00-\u9fff\w])'
-)
+# 金融术语读音修正（已禁用：LLM 已能生成流畅讲稿，不需要强制断句）
+# _FUTURES_TERMS = (
+#     r"空头|多头|期指|期货|持仓|减仓|开仓|平仓|基差|升水|贴水|连续平仓|政策面|资金面"
+# )
+# _FUTURES_TERMS_RE = re.compile(
+#     rf'([\u4e00-\u9fff\w])({_FUTURES_TERMS})([\u4e00-\u9fff\w])'
+# )
+_FUTURES_TERMS_RE = None  # 禁用强制断句
 
 SEGMENT_MAX_CHARS = 180  # 每段最大字数（避免 TTS 单次超长出错）
 
@@ -105,8 +106,10 @@ def _clean_tts_text(text: str) -> str:
     if result and result[-1] not in '。！？…':
         result += '。'
 
-    # 金融期货术语边界加停顿：让 TTS 正确断句而不卡顿
-    result = _FUTURES_TERMS_RE.sub(r'\1\2' + '\uff0c' + r'\3', result)
+    # 金融期货术语边界加停顿（已禁用：LLM 已能生成流畅讲稿）
+    # result = _FUTURES_TERMS_RE.sub(r'\1\2' + '，' + r'\3', result)
+    if _FUTURES_TERMS_RE:
+        result = _FUTURES_TERMS_RE.sub(r'\1\2' + '，' + r'\3', result)
     # 压缩连续逗号
     result = re.sub(r'\uff0c{2,}', '\uff0c', result)
     # 将半角逗号统一为全角（TTS 读音更自然）

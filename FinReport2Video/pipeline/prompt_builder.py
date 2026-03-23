@@ -9,7 +9,7 @@ import sys
 import re
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL
+from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
 
 try:
     from openai import OpenAI
@@ -67,7 +67,7 @@ def build_video_prompt(script_text: str, page_title: str = "") -> str:
     combined = f"{page_title} {script_text}"
 
     # 先尝试 LLM
-    if _openai_available and DEEPSEEK_API_KEY:
+    if _openai_available and LLM_API_KEY:
         try:
             prompt = _build_with_llm(combined)
             if prompt and 10 <= len(prompt) <= 150:
@@ -83,12 +83,12 @@ def build_video_prompt(script_text: str, page_title: str = "") -> str:
 
 
 def _build_with_llm(content: str) -> str:
-    """调用 DeepSeek 生成 prompt"""
-    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+    """调用 LLM 生成 prompt"""
+    client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
     # 截取前 300 字作为输入，避免 token 浪费
     user_input = content[:300].strip()
     resp = client.chat.completions.create(
-        model=DEEPSEEK_MODEL,
+        model=LLM_MODEL,
         messages=[
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": f"页面内容：{user_input}"},

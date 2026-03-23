@@ -4,13 +4,14 @@ PDF 解析模块
 - 提取页面内嵌图片（图表、K线图等）
 - 生成每页高清截图（作为视频背景底图）
 - 提取报告元信息（标题、摘要、分析师、日期）
+- 使用 LLM 智能识别页面标题
 """
 import os
 import re
 import fitz  # PyMuPDF
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict
-from config import PDF_DPI, PDF_MIN_IMAGE_SIZE, TEMP_DIR
+from config import PDF_DPI, PDF_MIN_IMAGE_SIZE, TEMP_DIR, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
 
 
 @dataclass
@@ -378,7 +379,7 @@ def _infer_title(page: fitz.Page) -> str:
                     if span["size"] > best_size and len(span["text"].strip()) > 2:
                         best_size = span["size"]
                         best_text = span["text"].strip()
-        return _clean_pdf_text(best_text)[:50]
+        return _clean_pdf_text(best_text)[:80]
     except Exception:
         return ""
 
@@ -401,11 +402,154 @@ def _get_doc_max_font(doc: fitz.Document) -> float:
     return max_size or 14.0
 
 
+# ── LLM 标题提取 ────────────────────────────────────────────────────────────────
+
+_LLM_CLIENT = None
+
+
+def _get_llm_client():
+    """获取 LLM 客户端（延迟初始化）"""
+    global _LLM_CLIENT
+    if _LLM_CLIENT is None and LLM_API_KEY:
+        try:
+            from openai import OpenAI
+            _LLM_CLIENT = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL, timeout=30)
+        except Exception:
+            pass
+    return _LLM_CLIENT
+
+
+def _is_valid_title(title: str) -> bool:
+    """
+    判断标题是否有效。
+    排除：纯符号、纯数字、过短、分隔线等无效标题。
+    """
+    if not title or len(title) < 3:
+        return False
+    
+    # 排除纯符号/分隔线（如 -、·、=、_ 等）
+    if re.match(r'^[\-·=+_\s\*#·]+$', title):
+        return False
+    
+    # 排除以符号开头且只有符号+少量文字的
+    if re.match(r'^[\-·=+_\*#"\'\[\(（]+$', title[0] if title else ''):
+        # 但允许 【xxx】 格式
+        if not re.match(r'^【[^】]+】$', title):
+            return False
+    
+    # 排除纯数字
+    if re.match(r'^\d+\.?\s*$', title):
+        return False
+    
+    # 排除包含大量重复符号的（如 ·······）
+    if len(re.sub(r'[·\-_=\s]', '', title)) < 3:
+        return False
+    
+    # 必须包含至少一个汉字或字母
+    if not re.search(r'[\u4e00-\u9fa5a-zA-Z]', title):
+        return False
+    
+    return True
+
+
+def _extract_title_with_llm(page_text: str, page_num: int) -> str:
+    """
+    智能提取页面标题。
+    优先使用简单规则识别常见标题格式，失败时调用 LLM。
+    
+    Args:
+        page_text: 页面提取的原始文本
+        page_num: 页码
+    
+    Returns:
+        提取的标题，如果不是新章节开头则返回空字符串
+    """
+    if not page_text or not page_text.strip():
+        return ""
+    
+    # 取前 200 字符分析
+    sample_text = page_text[:200].strip()
+    
+    # ── 第一步：简单规则匹配常见标题格式 ─────────────────────────────────────
+    # 匹配：一、xxx 或 二、xxx 等中文数字章节
+    match = re.match(r'^([一二三四五六七八九十]+[、.．]\s*[^\n]{2,25})', sample_text)
+    if match and _is_valid_title(match.group(1)):
+        return match.group(1).strip()
+    
+    # 匹配：1. xxx 或 1、xxx 等数字章节
+    match = re.match(r'^(\d{1,2}[、.．]\s*[^\n]{2,25})', sample_text)
+    if match and _is_valid_title(match.group(1)):
+        return match.group(1).strip()
+    
+    # 匹配：第X章/第X节
+    match = re.match(r'^(第[一二三四五六七八九十\d]+[章节][^\n]{0,20})', sample_text)
+    if match and _is_valid_title(match.group(1)):
+        return match.group(1).strip()
+    
+    # 匹配：【xxx】或 [xxx] 格式的标题
+    match = re.match(r'^[【\[]([^】\]]{2,30})[】\]]', sample_text)
+    if match and _is_valid_title(match.group(1)):
+        return match.group(1).strip()
+    
+    # ── 第二步：调用 LLM 判断是否是新章节 ─────────────────────────────────────
+    client = _get_llm_client()
+    if not client:
+        return ""
+    
+    try:
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "判断这个页面是否是新章节开头。如果是，输出章节标题（不超过20字）。如果不是，输出NONE。只输出结果，不要解释。"
+                },
+                {
+                    "role": "user",
+                    "content": f"第{page_num}页开头内容：\n{sample_text[:150]}"
+                }
+            ],
+            max_tokens=30,
+            temperature=0,
+        )
+        result = response.choices[0].message.content.strip() if response.choices[0].message.content else ""
+        
+        # 如果 LLM 返回 NONE，表示不是新章节
+        if "NONE" in result.upper() or not result:
+            return ""
+        
+        # 处理可能包含思考过程的情况：只取最后一行非空内容
+        lines = [l.strip() for l in result.split('\n') if l.strip()]
+        if lines:
+            result = lines[-1]  # 取最后一行作为标题
+        
+        # 排除包含无效关键词的输出
+        invalid_keywords = ['第', '页开头', '内容', '判断', '分析', '思考', '让我']
+        if any(kw in result for kw in invalid_keywords) and len(result) > 25:
+            return ""
+        
+        # 清理标题
+        result = re.sub(r'^[【\[（(]+', '', result)
+        result = re.sub(r'[】\]）)]+$', '', result)
+        result = re.sub(r'^["\'\s]+', '', result)  # 清理开头引号
+        result = re.sub(r'["\'\s]+$', '', result)  # 清理结尾引号
+        
+        # 最终验证
+        if not _is_valid_title(result):
+            return ""
+        
+        return result[:80] if result else ""
+    except Exception as e:
+        print(f"    [LLM标题提取失败] {e}")
+        return ""
+
+
 def _is_section_heading(page: fitz.Page, max_font: float) -> str:
     """
     判断页面第一行是否是大标题（章节标题）。
-    条件：字体 >= max_font * 0.72 且文字长度 <= 25 且不是纯数字。
+    条件：字体 >= max_font * 0.72 且文字长度 <= 40 且不是纯数字。
     返回标题文字，否则返回空字符串。
+    修复：同一行的所有 span 合并为完整标题，支持中英混合和 CJK 兼容字符。
     """
     threshold = max_font * 0.72
     try:
@@ -414,15 +558,34 @@ def _is_section_heading(page: fitz.Page, max_font: float) -> str:
             if block.get("type") != 0:
                 continue
             for line in block.get("lines", []):
+                # 收集该行所有有效文字的 spans，按原始顺序
+                line_spans = []
                 for span in line.get("spans", []):
                     txt = span["text"].strip()
-                    if not txt or len(txt) < 2:
+                    if not txt:
                         continue
-                    # 跳过纯数字/页码/日期行
-                    if re.match(r'^[\d\s\-./年月日]+$', txt):
+                    # 跳过纯空白/换行
+                    if not txt or txt in ['\n', '\r', ' ']:
                         continue
-                    if span["size"] >= threshold and len(txt) <= 30:
-                        return _clean_pdf_text(txt)[:50]
+                    # 跳过单独的标点符号
+                    if re.match(r'^[\s\-\-\_•●○■□]+$', txt):
+                        continue
+                    line_spans.append((span["size"], txt, span.get("flags", 0)))
+
+                if not line_spans:
+                    continue
+
+                # 判断是否为标题：主要字体 >= 阈值
+                max_span_size = max(s[0] for s in line_spans)
+                if max_span_size >= threshold:
+                    # 合并该行所有文字作为完整标题
+                    full_title = "".join(s[1] for s in line_spans)
+                    # 清理后验检：至少包含一个汉字或字母
+                    cleaned = _clean_pdf_text(full_title)
+                    # 检查是否包含有效字符（汉字、字母、数字）
+                    has_content = bool(re.search(r'[\u4e00-\u9fa5a-zA-Z0-9]', cleaned))
+                    if 2 <= len(cleaned) <= 80 and has_content:
+                        return cleaned[:80]
     except Exception:
         pass
     return ""
@@ -432,8 +595,9 @@ def parse_pdf_by_sections(pdf_path: str, pages: Optional[str] = None) -> List[Pa
     """
     按大标题（章节）解析 PDF，同一章节内所有 PDF 页合并为一个 PageData。
 
-    大标题判定：当前页首个文字块字体 >= 文档最大字体 * 0.72，且字数 <= 30。
-    每遇到新大标题就开启新章节；章节截图取该章节第一页，图片汇总所有页。
+    标题提取优先级：
+    1. LLM 智能提取（如果 LLM_API_KEY 已配置）
+    2. 字体大小判断（回退方案）
 
     Args:
         pdf_path: PDF 文件路径
@@ -456,7 +620,8 @@ def parse_pdf_by_sections(pdf_path: str, pages: Optional[str] = None) -> List[Pa
     os.makedirs(images_dir, exist_ok=True)
 
     max_font = _get_doc_max_font(doc)
-    print(f"  文档最大字体: {max_font:.1f}pt，大标题阈值: {max_font * 0.72:.1f}pt")
+    use_llm = bool(LLM_API_KEY and LLM_BASE_URL and LLM_MODEL)
+    print(f"  文档最大字体: {max_font:.1f}pt，标题提取: {'LLM智能' if use_llm else '字体判断'}")
 
     # ── 第一遍：将所有 PDF 页按大标题归组 ──────────────────────────────────────
     sections: List[dict] = []  # [{start_page, title, page_indices}]
@@ -464,14 +629,28 @@ def parse_pdf_by_sections(pdf_path: str, pages: Optional[str] = None) -> List[Pa
 
     for page_idx in range(total_pages):
         page = doc[page_idx]
-        heading = _is_section_heading(page, max_font)
+        page_num = page_idx + 1
+        
+        # 优先使用 LLM 提取标题
+        heading = ""
+        if use_llm:
+            page_text = _extract_text(page)
+            heading = _extract_title_with_llm(page_text, page_num)
+        
+        # LLM 失败时回退到字体判断
+        if not heading:
+            heading = _is_section_heading(page, max_font)
+        
+        # 第一页始终需要标题
+        if page_idx == 0 and not heading:
+            heading = _infer_title(page) or f"第 {page_num} 页"
 
         if heading:
             # 新章节
             if current_section is not None:
                 sections.append(current_section)
             current_section = {
-                "start_page": page_idx + 1,
+                "start_page": page_num,
                 "title": heading,
                 "page_indices": [page_idx],
             }
@@ -498,7 +677,7 @@ def parse_pdf_by_sections(pdf_path: str, pages: Optional[str] = None) -> List[Pa
     # ── 第二遍：为每个章节生成 PageData ────────────────────────────────────────
     result: List[PageData] = []
     for sec_idx, sec in enumerate(selected_sections, 1):
-        print(f"  处理章节 {sec_idx}/{len(selected_sections)}: [{sec['title'][:20]}] ({len(sec['page_indices'])} 页)")
+        print(f"  处理章节 {sec_idx}/{len(selected_sections)}: [{sec['title'][:50]}] ({len(sec['page_indices'])} 页)")
 
         # 合并所有页的文字
         texts = []

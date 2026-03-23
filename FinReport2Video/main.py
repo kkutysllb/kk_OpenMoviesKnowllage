@@ -43,7 +43,8 @@ def _process_page(page, pdf_name, skip_llm, no_ai_image, voice):
     print(f"  [{tid}] 开始处理第 {pn} 页: {page.title or '(无标题)'}")
 
     # 2a. LLM 润色讲稿（串行，后续步骤依赖脚本内容）
-    script = write_script(page.text, page_title=page.title, skip_llm=skip_llm)
+    script = write_script(page.text, page_title=page.title, skip_llm=skip_llm,
+                          pdf_name=pdf_name, page_num=pn)
     print(f"  [{tid}] 第 {pn} 页 ✔ 讲稿 ({len(script)}字)")
 
     # 2b/2c/2d. 配图 + TTS + 背景视频 三路并发
@@ -244,7 +245,7 @@ def main():
                 elapsed_so_far = time.time() - t2_start
                 done = len(clips_map)
                 total = len(pages_data)
-                print(f"  进度: {done}/{total} 页完成 ({elapsed_so_far:.0f}s 已耗)")
+                print(f"  进度: {done}/{total} 页完成 ({elapsed_so_far:.0f}s 已耗)", flush=True)
             except Exception as e:
                 print(f"  [错误] 第 {pn} 页处理失败: {e}")
 

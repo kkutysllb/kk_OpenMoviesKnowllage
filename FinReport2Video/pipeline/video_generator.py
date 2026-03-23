@@ -25,7 +25,7 @@ from PIL import Image, ImageFilter, ImageEnhance, ImageDraw
 from moviepy import VideoClip
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import VIDEO_SIZE, VIDEO_FPS
+from config import VIDEO_SIZE, VIDEO_FPS, BG_VIDEO_FPS
 
 VW, VH = VIDEO_SIZE
 
@@ -52,8 +52,8 @@ def generate_intro_bg_video(
     try:
         clip = _make_futures_intro_clip(duration, theme)
         clip.write_videofile(
-            save_path, fps=VIDEO_FPS, codec="libx264",
-            preset="fast", logger=None,
+            save_path, fps=BG_VIDEO_FPS, codec="libx264",
+            preset="ultrafast", logger=None,
         )
         size_kb = os.path.getsize(save_path) / 1024
         print(f"    片头背景已生成: {save_path} ({size_kb:.0f} KB)")
@@ -237,9 +237,9 @@ def generate_bg_video(
         # 3. 导出 mp4
         clip.write_videofile(
             save_path,
-            fps=VIDEO_FPS,
+            fps=BG_VIDEO_FPS,
             codec="libx264",
-            preset="fast",
+            preset="ultrafast",
             logger=None,
         )
         size_kb = os.path.getsize(save_path) / 1024

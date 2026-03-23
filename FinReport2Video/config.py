@@ -24,10 +24,10 @@ def _load_dotenv():
 
 _load_dotenv()
 
-# ── LLM (DeepSeek) ────────────────────────────────────────────────────────────
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
-DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+# ── LLM (统一配置) ────────────────────────────────────────────────────────────
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "")
+LLM_MODEL = os.getenv("LLM_MODEL", "")
 
 # ── 通义万相图片生成 ────────────────────────────────────────────────────────────
 QWEN_IMAGE_API_KEY = os.getenv("QWEN_IMAGE_API_KEY", "")
@@ -42,7 +42,8 @@ TTS_RATE = "+0%"                      # 语速，可调 +10% 加快
 TTS_VOLUME = "+0%"
 
 # ── 视频参数 ───────────────────────────────────────────────────────────────────
-VIDEO_FPS = 24
+VIDEO_FPS = 24                        # 最终输出视频帧率
+BG_VIDEO_FPS = 15                     # 背景视频帧率（15fps 充足，编码量减少37%）
 VIDEO_SIZE = (1920, 1080)             # 1080p
 
 # ── 目录 ──────────────────────────────────────────────────────────────────────
@@ -56,8 +57,8 @@ PDF_DPI = 150                          # 页面截图分辨率
 PDF_MIN_IMAGE_SIZE = 5000              # 忽略小于此像素数的图片（去除噪点小图）
 
 # ── LLM 讲稿 ─────────────────────────────────────────────────────────────────
-SCRIPT_MIN_CHARS = 100                 # 讲稿最少字数
-SCRIPT_MAX_CHARS = 300                 # 讲稿最多字数
+SCRIPT_MIN_CHARS = 300                 # 讲稿最少字数
+SCRIPT_MAX_CHARS = 800                 # 讲稿最多字数
 
 # ── 字幕 ──────────────────────────────────────────────────────────────────────
 SUBTITLE_FONT_SIZE = 32

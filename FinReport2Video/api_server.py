@@ -10,6 +10,8 @@ import uuid
 import time
 import threading
 import subprocess
+import hashlib
+from urllib.parse import quote
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -25,6 +27,39 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
 from config import OUTPUT_DIR, TEMP_DIR, INPUT_DIR
+from pipeline.pdf_parser import parse_pdf_by_sections
+
+# ── 文件重复检查 ────────────────────────────────────────────────────────────────
+
+def _compute_file_hash(content: bytes) -> str:
+    """计算文件内容的 MD5 hash"""
+    return hashlib.md5(content).hexdigest()
+
+
+def _find_duplicate_file(content: bytes, input_dir: str) -> str | None:
+    """
+    检查 input_dir 下是否有相同内容的文件
+    返回已存在文件的路径，如果没有返回 None
+    """
+    target_hash = _compute_file_hash(content)
+    
+    if not os.path.exists(input_dir):
+        return None
+    
+    for filename in os.listdir(input_dir):
+        if not filename.endswith('.pdf'):
+            continue
+        filepath = os.path.join(input_dir, filename)
+        try:
+            with open(filepath, 'rb') as f:
+                existing_hash = _compute_file_hash(f.read())
+            if existing_hash == target_hash:
+                return filepath
+        except Exception:
+            continue
+    
+    return None
+
 
 # ── 任务状态定义 ───────────────────────────────────────────────────────────────
 
@@ -90,21 +125,33 @@ def _append_log(task_id: str, line: str):
 
 
 def _parse_progress(line: str) -> Optional[int]:
-    """从日志行解析进度（0-100）"""
+    """从日志行解析进度（0-100）。适配并发改造后的日志格式。"""
+    # Step 1/5  解析 PDF
     if "Step 1/5" in line:
         return 5
+    # Step 1.5/5  生成片头页
     if "Step 1.5/5" in line:
         return 10
-    if "处理第" in line and "/8" in line:
+    # Step 2/5  并发处理 N 页（并发次入口日志）
+    if "Step 2/5" in line and "并发处理" in line:
+        return 12
+    # 并发进度："进度: {done}/{total} 页完成"
+    if "进度:" in line and "页完成" in line:
         try:
-            part = line.split("（")[1].split("）")[0]
+            # 格式："  进度: 3/11 页完成 (45s 已耗)"
+            part = line.split("进度:")[1].strip().split("页完成")[0].strip()
             cur, total = part.split("/")
-            return 10 + int(int(cur) / int(total) * 75)
+            cur = int(cur.strip())
+            total = int(total.strip())
+            if total > 0:
+                return 12 + int(cur / total * 70)   # 12% ~ 82%
         except Exception:
-            return None
+            pass
+    # Step 3/5  合并视频片段
     if "Step 3/5" in line:
-        return 88
-    if "Step 4/5" in line or "完成" in line and "输出文件" in line:
+        return 85
+    # 完成
+    if "视频已保存" in line or "完成！" in line:
         return 100
     return None
 
@@ -141,20 +188,40 @@ def _run_generation(task_id: str, pdf_path: str, skip_llm: bool, pages: Optional
             text=True,
             bufsize=1,
             cwd=BASE_DIR,
+            env={**os.environ, 'PYTHONUNBUFFERED': '1'},  # 强制 Python 无缓冲输出
         )
         # 注册子进程，供取消接口使用
         with PROCS_LOCK:
             PROCS[task_id] = proc
 
-        for line in proc.stdout:
-            line = line.rstrip()
-            if line:
-                _append_log(task_id, f"[{datetime.now().strftime('%H:%M:%S')}] {line}")
-                prog = _parse_progress(line)
-                if prog is not None:
-                    _update_task(task_id, progress=prog)
+        # 实时读取输出
+        import select
+        while True:
+            # 检查进程是否结束
+            ret = proc.poll()
+            # 非阻塞读取可用的输出
+            ready, _, _ = select.select([proc.stdout], [], [], 0.1)
+            if proc.stdout in ready:
+                line = proc.stdout.readline()
+                if line:
+                    line = line.rstrip()
+                    if line:
+                        _append_log(task_id, f"[{datetime.now().strftime('%H:%M:%S')}] {line}")
+                        prog = _parse_progress(line)
+                        if prog is not None:
+                            _update_task(task_id, progress=prog)
+            # 进程结束且没有更多输出
+            if ret is not None:
+                # 清空剩余输出
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    if line:
+                        _append_log(task_id, f"[{datetime.now().strftime('%H:%M:%S')}] {line}")
+                        prog = _parse_progress(line)
+                        if prog is not None:
+                            _update_task(task_id, progress=prog)
+                break
 
-        proc.wait()
         # 清理进程注册
         with PROCS_LOCK:
             PROCS.pop(task_id, None)
@@ -197,6 +264,49 @@ def health():
     return {"status": "ok", "service": "FinReport2Video"}
 
 
+@app.post("/api/parse")
+async def parse_pdf_chapters(
+    pdf: UploadFile = File(...),
+    pages: Optional[str] = Form(None),
+):
+    """上传 PDF 并解析章节标题列表（用于前端动画展示）"""
+    if not pdf.filename.endswith(".pdf"):
+        raise HTTPException(400, "只支持 PDF 文件")
+
+    # 保存临时文件
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    tmp_name = f"parse_{int(time.time())}_{pdf.filename}"
+    pdf_path = os.path.join(TEMP_DIR, tmp_name)
+    content = await pdf.read()
+    with open(pdf_path, "wb") as f:
+        f.write(content)
+
+    try:
+        # 调用 PDF 解析获取章节信息
+        pages_data = parse_pdf_by_sections(pdf_path, pages=pages)
+        chapters = [
+            {
+                "page_num": p.page_num,
+                "title": p.title or f"第 {p.page_num} 章",
+                "preview": p.text[:80] + "..." if len(p.text) > 80 else p.text
+            }
+            for p in pages_data
+        ]
+        return {
+            "filename": pdf.filename,
+            "total_pages": len(chapters),
+            "chapters": chapters
+        }
+    except Exception as e:
+        raise HTTPException(500, f"解析失败: {str(e)}")
+    finally:
+        # 清理临时文件
+        try:
+            os.remove(pdf_path)
+        except Exception:
+            pass
+
+
 @app.post("/api/generate")
 async def generate_video(
     pdf: UploadFile = File(...),
@@ -207,13 +317,22 @@ async def generate_video(
     if not pdf.filename.endswith(".pdf"):
         raise HTTPException(400, "只支持 PDF 文件")
 
-    # 保存上传文件到 input/
-    os.makedirs(INPUT_DIR, exist_ok=True)
-    safe_name = f"{int(time.time())}_{pdf.filename}"
-    pdf_path = os.path.join(INPUT_DIR, safe_name)
+    # 读取上传文件内容
     content = await pdf.read()
-    with open(pdf_path, "wb") as f:
-        f.write(content)
+    
+    # 检查是否已存在相同内容的文件
+    existing_path = _find_duplicate_file(content, INPUT_DIR)
+    if existing_path:
+        print(f"    [上传] 文件已存在，复用: {existing_path}")
+        pdf_path = existing_path
+    else:
+        # 保存新文件到 input/
+        os.makedirs(INPUT_DIR, exist_ok=True)
+        safe_name = f"{int(time.time())}_{pdf.filename}"
+        pdf_path = os.path.join(INPUT_DIR, safe_name)
+        with open(pdf_path, "wb") as f:
+            f.write(content)
+        print(f"    [上传] 保存新文件: {pdf_path}")
 
     # 创建任务
     task_id = str(uuid.uuid4())[:8]
@@ -254,6 +373,94 @@ def list_tasks():
         tasks = list(TASKS.values())
     tasks.sort(key=lambda t: t.created_at, reverse=True)
     return [t.dict() for t in tasks]
+
+
+@app.get("/api/videos")
+def list_output_videos():
+    """
+    扫描 output 目录返回已生成的视频列表。
+    用于后端重启后前端追溯历史视频。
+    """
+    output_dir = OUTPUT_DIR
+    videos = []
+    if os.path.exists(output_dir):
+        for filename in sorted(os.listdir(output_dir), reverse=True):
+            if not filename.endswith('.mp4'):
+                continue
+            filepath = os.path.join(output_dir, filename)
+            try:
+                stat = os.stat(filepath)
+                # 从文件名解析：格式为 YYYYmmdd_xxx.mp4
+                name_no_ext = filename[:-4]  # 去挈9 .mp4
+                # 取文件名作为 pdf_name（去挈4位日期前缀）
+                if len(name_no_ext) > 9 and name_no_ext[8] == '_':
+                    pdf_name = name_no_ext[9:]  # 20260320_xxx -> xxx
+                else:
+                    pdf_name = name_no_ext
+                created_ts = stat.st_mtime
+                created_at = datetime.fromtimestamp(created_ts).isoformat()
+                videos.append({
+                    "filename": filename,
+                    "pdf_name": pdf_name + ".pdf",
+                    "output_path": filepath,
+                    "file_size_mb": round(stat.st_size / 1024 / 1024, 1),
+                    "created_at": created_at,
+                })
+            except Exception:
+                continue
+    return videos
+
+
+@app.get("/api/video/file")
+def stream_video_by_path(path: str, range: Optional[str] = None):
+    """按文件路径流式返回视频（用于历史视频播放）"""
+    # 安全校验：必须在 output 目录内
+    abs_path = os.path.realpath(path)
+    abs_output = os.path.realpath(OUTPUT_DIR)
+    if not abs_path.startswith(abs_output):
+        raise HTTPException(403, "无权访问该文件")
+    if not os.path.exists(abs_path):
+        raise HTTPException(404, "视频文件不存在")
+
+    file_size = os.path.getsize(abs_path)
+    start, end = 0, file_size - 1
+    status_code = 200
+    if range:
+        try:
+            range_val = range.replace("bytes=", "")
+            parts = range_val.split("-")
+            start = int(parts[0]) if parts[0] else 0
+            end = int(parts[1]) if parts[1] else file_size - 1
+            status_code = 206
+        except Exception:
+            pass
+
+    chunk_size = 1024 * 1024
+
+    def iterfile():
+        remaining = end - start + 1
+        with open(abs_path, "rb") as f:
+            f.seek(start)
+            while remaining > 0:
+                data = f.read(min(chunk_size, remaining))
+                if not data:
+                    break
+                remaining -= len(data)
+                yield data
+
+    filename = os.path.basename(abs_path)
+    headers = {
+        "Content-Range": f"bytes {start}-{end}/{file_size}",
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(end - start + 1),
+        "Content-Disposition": f"inline; filename*=UTF-8''{quote(filename)}",
+    }
+    return StreamingResponse(
+        iterfile(),
+        status_code=status_code,
+        media_type="video/mp4",
+        headers=headers,
+    )
 
 
 @app.get("/api/video/{task_id}")
@@ -299,7 +506,7 @@ def stream_video(task_id: str, range: Optional[str] = None):
         "Content-Range": f"bytes {start}-{end}/{file_size}",
         "Accept-Ranges": "bytes",
         "Content-Length": str(end - start + 1),
-        "Content-Disposition": f'inline; filename="{os.path.basename(output_path)}"',
+        "Content-Disposition": f"inline; filename*=UTF-8''{quote(os.path.basename(output_path))}",
     }
     return StreamingResponse(
         iterfile(),
@@ -307,6 +514,26 @@ def stream_video(task_id: str, range: Optional[str] = None):
         media_type="video/mp4",
         headers=headers,
     )
+
+
+@app.delete("/api/video/file")
+def delete_video_file(path: str):
+    """删除指定路径的视频文件。
+    安全校验：必须在 output 目录内。
+    """
+    # 安全校验：必须在 output 目录内
+    abs_path = os.path.realpath(path)
+    abs_output = os.path.realpath(OUTPUT_DIR)
+    if not abs_path.startswith(abs_output):
+        raise HTTPException(403, "无权访问该文件")
+    if not os.path.exists(abs_path):
+        raise HTTPException(404, "视频文件不存在")
+    
+    try:
+        os.remove(abs_path)
+        return {"success": True, "message": "文件已删除"}
+    except Exception as e:
+        raise HTTPException(500, f"删除失败: {str(e)}")
 
 
 @app.post("/api/cancel/{task_id}")
@@ -367,17 +594,65 @@ def download_video(task_id: str):
         iterfile(),
         media_type="video/mp4",
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",
             "Content-Length": str(file_size),
         },
     )
 
 
+@app.delete("/api/task/{task_id}")
+def cleanup_task(task_id: str):
+    """清理任务相关的临时资源"""
+    import shutil
+    
+    with TASKS_LOCK:
+        task = TASKS.get(task_id)
+    
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    
+    cleaned = []
+    
+    # 清理 temp/{pdf_name}/ 目录
+    if task.pdf_path:
+        pdf_name = os.path.splitext(os.path.basename(task.pdf_path))[0]
+        # 去掉时间戳前缀 (如 1234567890_filename -> filename)
+        if '_' in pdf_name:
+            pdf_name = pdf_name.split('_', 1)[1]
+        temp_dir = os.path.join(TEMP_DIR, pdf_name)
+        if os.path.exists(temp_dir):
+            try:
+                shutil.rmtree(temp_dir)
+                cleaned.append(f"temp/{pdf_name}/")
+                print(f"    [清理] 已删除临时目录: {temp_dir}")
+            except Exception as e:
+                print(f"    [清理] 删除临时目录失败: {e}")
+    
+    # 清理 input/ 中的 PDF 文件
+    if task.pdf_path and os.path.exists(task.pdf_path):
+        try:
+            os.remove(task.pdf_path)
+            cleaned.append(f"input/{os.path.basename(task.pdf_path)}")
+            print(f"    [清理] 已删除输入文件: {task.pdf_path}")
+        except Exception as e:
+            print(f"    [清理] 删除输入文件失败: {e}")
+    
+    # 从内存中移除任务
+    with TASKS_LOCK:
+        TASKS.pop(task_id, None)
+    
+    return {
+        "task_id": task_id,
+        "cleaned": cleaned,
+        "message": f"已清理 {len(cleaned)} 项资源"
+    }
+
+
 # 可配置的 .env key 列表（顺序将在前端展示）
 _ENV_KEYS = [
-    "DEEPSEEK_API_KEY",
-    "DEEPSEEK_BASE_URL",
-    "DEEPSEEK_MODEL",
+    "LLM_API_KEY",
+    "LLM_BASE_URL",
+    "LLM_MODEL",
     "QWEN_IMAGE_API_KEY",
 ]
 

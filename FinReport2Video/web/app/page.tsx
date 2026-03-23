@@ -6,6 +6,18 @@ import { useState, useRef, useCallback, useEffect } from 'react'
 
 type TaskStatus = 'pending' | 'running' | 'completed' | 'failed'
 
+interface Chapter {
+  page_num: number
+  title: string
+  preview: string
+}
+
+interface ParseResult {
+  filename: string
+  total_pages: number
+  chapters: Chapter[]
+}
+
 interface Task {
   task_id: string
   filename: string
@@ -20,10 +32,18 @@ interface Task {
   file_size_mb?: number
 }
 
+interface HistoryVideo {
+  filename: string       // mp4 文件名
+  pdf_name: string       // 推断的 pdf 文件名
+  output_path: string    // 服务器上的绝对路径
+  file_size_mb: number
+  created_at: string
+}
+
 interface Config {
-  DEEPSEEK_API_KEY: string
-  DEEPSEEK_BASE_URL: string
-  DEEPSEEK_MODEL: string
+  LLM_API_KEY: string
+  LLM_BASE_URL: string
+  LLM_MODEL: string
   QWEN_IMAGE_API_KEY: string
 }
 
@@ -52,9 +72,9 @@ const formatTime = (iso: string) =>
 
 function ConfigModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [form, setForm] = useState<Config>({
-    DEEPSEEK_API_KEY: '',
-    DEEPSEEK_BASE_URL: '',
-    DEEPSEEK_MODEL: '',
+    LLM_API_KEY: '',
+    LLM_BASE_URL: '',
+    LLM_MODEL: '',
     QWEN_IMAGE_API_KEY: '',
   })
   const [loading, setLoading] = useState(false)
@@ -97,9 +117,9 @@ function ConfigModal({ open, onClose }: { open: boolean; onClose: () => void }) 
   if (!open) return null
 
   const fields: { key: keyof Config; label: string; placeholder: string; isKey?: boolean }[] = [
-    { key: 'DEEPSEEK_API_KEY',   label: 'DeepSeek API Key',   placeholder: 'sk-...',                    isKey: true },
-    { key: 'DEEPSEEK_BASE_URL',  label: 'DeepSeek Base URL',  placeholder: 'https://api.deepseek.com/v1' },
-    { key: 'DEEPSEEK_MODEL',     label: 'DeepSeek 模型名',     placeholder: 'deepseek-chat' },
+    { key: 'LLM_API_KEY',   label: 'LLM API Key',   placeholder: 'sk-...',                    isKey: true },
+    { key: 'LLM_BASE_URL',  label: 'LLM Base URL',  placeholder: 'https://api.openai.com/v1' },
+    { key: 'LLM_MODEL',     label: 'LLM 模型名',     placeholder: 'gpt-4' },
     { key: 'QWEN_IMAGE_API_KEY', label: '通义万相 API Key',    placeholder: 'sk-...',                    isKey: true },
   ]
 
@@ -214,12 +234,121 @@ function ProgressBar({ progress, status }: { progress: number; status: TaskStatu
   )
 }
 
+// ── 章节预览动画组件 ─────────────────────────────────────────────────────────────────────────────────────────
+
+function ChapterPreview({
+  result,
+  onConfirm,
+  onCancel,
+}: {
+  result: ParseResult
+  onConfirm: () => void
+  onCancel: () => void
+}) {
+  const [visibleCount, setVisibleCount] = useState(0)
+  const [isComplete, setIsComplete] = useState(false)
+
+  useEffect(() => {
+    // 逐个显示动画
+    setVisibleCount(0)
+    setIsComplete(false)
+    const timers: NodeJS.Timeout[] = []
+    result.chapters.forEach((_, idx) => {
+      timers.push(setTimeout(() => {
+        setVisibleCount(prev => prev + 1)
+        if (idx === result.chapters.length - 1) {
+          setTimeout(() => setIsComplete(true), 300)
+        }
+      }, idx * 150))  // 每 150ms 显示一个
+    })
+    return () => timers.forEach(clearTimeout)
+  }, [result])
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={onCancel} />
+      <div className="relative w-full max-w-2xl max-h-[80vh] bg-slate-900 border border-slate-700/60 rounded-2xl shadow-2xl flex flex-col">
+        {/* 头部 */}
+        <div className="flex items-center justify-between px-6 py-4 border-b border-slate-700/60">
+          <div>
+            <h3 className="font-semibold text-slate-100">文档章节预览</h3>
+            <p className="text-xs text-slate-500 mt-0.5">{result.filename} · 共 {result.total_pages} 章</p>
+          </div>
+          <button onClick={onCancel} className="text-slate-500 hover:text-slate-300 transition-colors">
+            <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+            </svg>
+          </button>
+        </div>
+
+        {/* 章节列表 */}
+        <div className="flex-1 overflow-y-auto px-6 py-4 space-y-2">
+          {result.chapters.map((chapter, idx) => (
+            <div
+              key={chapter.page_num}
+              className={`flex items-start gap-3 p-3 rounded-xl border transition-all duration-300 ${
+                idx < visibleCount
+                  ? 'opacity-100 translate-y-0 bg-slate-800/60 border-slate-700/40'
+                  : 'opacity-0 translate-y-4 pointer-events-none'
+              }`}
+              style={{ transitionDelay: `${idx * 50}ms` }}
+            >
+              <div className="w-8 h-8 rounded-lg bg-orange-500/15 border border-orange-500/30 flex items-center justify-center flex-shrink-0">
+                <span className="text-xs font-semibold text-orange-400">{chapter.page_num}</span>
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-medium text-slate-200 truncate">{chapter.title}</p>
+                <p className="text-xs text-slate-500 mt-0.5 line-clamp-1">{chapter.preview}</p>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* 底部按钮 */}
+        <div className="flex items-center justify-between px-6 py-4 border-t border-slate-700/60">
+          <div className="flex items-center gap-2">
+            {!isComplete ? (
+              <>
+                <span className="w-2 h-2 rounded-full bg-orange-500 animate-pulse" />
+                <span className="text-xs text-slate-500">解析中...</span>
+              </>
+            ) : (
+              <>
+                <svg className="w-4 h-4 text-emerald-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <polyline points="20 6 9 17 4 12"/>
+                </svg>
+                <span className="text-xs text-emerald-400">已解析完成</span>
+              </>
+            )}
+          </div>
+          <div className="flex gap-3">
+            <button
+              onClick={onCancel}
+              className="px-4 py-2 rounded-xl text-sm border border-slate-600/60 text-slate-400 hover:bg-slate-800 transition-colors"
+            >
+              取消
+            </button>
+            <button
+              onClick={onConfirm}
+              disabled={!isComplete}
+              className="px-4 py-2 rounded-xl text-sm font-medium bg-gradient-to-r from-orange-600 to-orange-500 hover:from-orange-500 hover:to-orange-400 text-white transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              确认生成视频
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ── 任务卡片组件 ──────────────────────────────────────────────────────────────
 
 function TaskCard({ task, onRefresh, onCancel }: { task: Task; onRefresh: () => void; onCancel: (id: string) => void }) {
   const [showLog, setShowLog] = useState(false)
   const [showPlayer, setShowPlayer] = useState(false)
   const [cancelling, setCancelling] = useState(false)
+  const [cleaning, setCleaning] = useState(false)
   const logRef = useRef<HTMLDivElement>(null)
 
   // 日志自动滚到底
@@ -240,6 +369,18 @@ function TaskCard({ task, onRefresh, onCancel }: { task: Task; onRefresh: () => 
       onCancel(task.task_id)
     } catch {}
     finally { setCancelling(false) }
+  }
+
+  const handleCleanup = async () => {
+    if (!confirm('确定要清理该任务的所有临时资源吗？\n清理后将无法再次下载视频。')) return
+    setCleaning(true)
+    try {
+      const res = await fetch(API(`task/${task.task_id}`), { method: 'DELETE' })
+      if (res.ok) {
+        onCancel(task.task_id) // 从列表中移除任务
+      }
+    } catch {}
+    finally { setCleaning(false) }
   }
 
   return (
@@ -310,6 +451,17 @@ function TaskCard({ task, onRefresh, onCancel }: { task: Task; onRefresh: () => 
                 </svg>
                 下载
               </a>
+              <button
+                onClick={handleCleanup}
+                disabled={cleaning}
+                className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-red-500/15 border border-red-500/30 text-red-400 hover:bg-red-500/25 transition-colors disabled:opacity-50"
+              >
+                <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <polyline points="3 6 5 6 21 6"/>
+                  <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                </svg>
+                {cleaning ? '清理中...' : '清理资源'}
+              </button>
             </>
           )}
           {(task.status === 'running' || task.status === 'pending') && (
@@ -374,6 +526,170 @@ function TaskCard({ task, onRefresh, onCancel }: { task: Task; onRefresh: () => 
         </div>
       )}
     </div>
+  )
+}
+
+// ── 历史视频卡片（后端重启后从文件系统恢复）────────────────────────────────
+
+function HistoryVideoCard({ video, onDelete }: { video: HistoryVideo; onDelete: (output_path: string) => void }) {
+  const [showPlayer, setShowPlayer] = useState(false)
+  const [deleting, setDeleting] = useState(false)
+  // 通过 /api/py/video/file?path=... 播放
+  const videoSrc = `/api/py/video/file?path=${encodeURIComponent(video.output_path)}`
+  const downloadUrl = videoSrc  // 直接下载同一地址
+
+  const handleDelete = async () => {
+    if (!confirm(`确定要删除该视频吗？\n${video.pdf_name}\n此操作不可恢复。`)) return
+    setDeleting(true)
+    try {
+      const res = await fetch(API(`video/file?path=${encodeURIComponent(video.output_path)}`), {
+        method: 'DELETE'
+      })
+      if (res.ok) {
+        onDelete(video.output_path)
+      } else {
+        alert('删除失败，请重试')
+      }
+    } catch {
+      alert('删除失败，请检查网络')
+    } finally {
+      setDeleting(false)
+    }
+  }
+
+  return (
+    <div className="bg-slate-800/40 border border-slate-700/40 rounded-xl overflow-hidden">
+      <div className="p-4">
+        <div className="flex items-start justify-between gap-3">
+          {/* 文件图标 + 名称 */}
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="w-9 h-9 rounded-lg bg-slate-700/50 border border-slate-600/40 flex items-center justify-center flex-shrink-0">
+              <svg className="w-4 h-4 text-slate-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <polygon points="23 7 16 12 23 17 23 7"/>
+                <rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
+              </svg>
+            </div>
+            <div className="min-w-0">
+              <p className="text-sm font-medium text-slate-300 truncate">{video.pdf_name}</p>
+              <p className="text-xs text-slate-500 mt-0.5">
+                {formatTime(video.created_at)} · {video.file_size_mb} MB
+              </p>
+            </div>
+          </div>
+          {/* 标记为历史视频 */}
+          <span className="text-xs px-2.5 py-1 rounded-full border font-medium flex-shrink-0 text-slate-400 bg-slate-700/40 border-slate-600/40">
+            历史视频
+          </span>
+        </div>
+
+        {/* 操作按钮 */}
+        <div className="flex gap-2 mt-3">
+          <button
+            onClick={() => setShowPlayer(!showPlayer)}
+            className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-orange-500/15 border border-orange-500/30 text-orange-400 hover:bg-orange-500/25 transition-colors"
+          >
+            <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor">
+              <polygon points="5 3 19 12 5 21 5 3"/>
+            </svg>
+            {showPlayer ? '收起播放器' : '播放视频'}
+          </button>
+          <a
+            href={downloadUrl}
+            download={video.filename}
+            className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-slate-700/50 border border-slate-600/50 text-slate-300 hover:bg-slate-700 transition-colors"
+          >
+            <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="7 10 12 15 17 10"/>
+              <line x1="12" y1="15" x2="12" y2="3"/>
+            </svg>
+            下载
+          </a>
+          <button
+            onClick={handleDelete}
+            disabled={deleting}
+            className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-red-500/15 border border-red-500/30 text-red-400 hover:bg-red-500/25 transition-colors disabled:opacity-50 ml-auto"
+          >
+            <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <polyline points="3 6 5 6 21 6"/>
+              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+            </svg>
+            {deleting ? '删除中...' : '删除'}
+          </button>
+        </div>
+      </div>
+
+      {/* 视频播放器 */}
+      {showPlayer && (
+        <div className="border-t border-slate-700/60 bg-black">
+          <video
+            key={videoSrc}
+            src={videoSrc}
+            controls
+            className="w-full max-h-[500px] bg-black"
+            preload="metadata"
+          />
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── 历史视频区块（带折叠）──────────────────────────────────────────────────────────
+
+const HISTORY_PREVIEW_COUNT = 1  // 默认展示条数
+
+function HistoryVideoSection({ videos, onDelete }: { videos: HistoryVideo[]; onDelete: (path: string) => void }) {
+  const [expanded, setExpanded] = useState(false)
+  const shown = expanded ? videos : videos.slice(0, HISTORY_PREVIEW_COUNT)
+  const hiddenCount = videos.length - HISTORY_PREVIEW_COUNT
+
+  return (
+    <section>
+      {/* 标题行 */}
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-sm font-medium text-slate-400 uppercase tracking-wider">历史视频</h2>
+        {videos.length > HISTORY_PREVIEW_COUNT && (
+          <button
+            onClick={() => setExpanded(!expanded)}
+            className="flex items-center gap-1 text-xs text-slate-500 hover:text-slate-300 transition-colors"
+          >
+            {expanded ? (
+              <>
+                <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <polyline points="18 15 12 9 6 15"/>
+                </svg>
+                收起
+              </>
+            ) : (
+              <>
+                <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <polyline points="6 9 12 15 18 9"/>
+                </svg>
+                展开全部 {videos.length} 条
+              </>
+            )}
+          </button>
+        )}
+      </div>
+
+      {/* 卡片列表 */}
+      <div className="space-y-3">
+        {shown.map(video => (
+          <HistoryVideoCard key={video.output_path} video={video} onDelete={onDelete} />
+        ))}
+      </div>
+
+      {/* 未展开时显示提示 */}
+      {!expanded && hiddenCount > 0 && (
+        <button
+          onClick={() => setExpanded(true)}
+          className="mt-2 w-full py-2 text-xs text-slate-500 hover:text-slate-300 border border-dashed border-slate-700/60 hover:border-slate-600 rounded-xl transition-colors"
+        >
+          还有 {hiddenCount} 条历史视频，点击展开
+        </button>
+      )}
+    </section>
   )
 }
 
@@ -513,12 +829,16 @@ function UploadZone({ onSubmit, uploading }: {
 
 export default function Home() {
   const [tasks, setTasks] = useState<Task[]>([])
+  const [historyVideos, setHistoryVideos] = useState<HistoryVideo[]>([])
   const [uploading, setUploading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [configOpen, setConfigOpen] = useState(false)
+  const [parseResult, setParseResult] = useState<ParseResult | null>(null)
+  const [pendingFile, setPendingFile] = useState<{ file: File; skipLlm: boolean; pages: string } | null>(null)
   const pollingRef = useRef<NodeJS.Timeout | null>(null)
+  const initialLoadRef = useRef(false)
 
-  // 轮询所有活跃任务
+  // 刷新任务列表
   const refreshTasks = useCallback(async () => {
     try {
       const res = await fetch(API('tasks'))
@@ -528,22 +848,71 @@ export default function Home() {
     } catch {}
   }, [])
 
-  // 定时轮询（有运行中任务时每 3s 刷新）
+  // 加载历史视频（output 目录下已生成的）
+  const loadHistoryVideos = useCallback(async () => {
+    try {
+      const res = await fetch(API('videos'))
+      if (!res.ok) return
+      const data: HistoryVideo[] = await res.json()
+      setHistoryVideos(data)
+    } catch {}
+  }, [])
+
+  // 首次加载
   useEffect(() => {
-    refreshTasks()
-    pollingRef.current = setInterval(() => {
+    if (!initialLoadRef.current) {
+      initialLoadRef.current = true
       refreshTasks()
-    }, 3000)
+      loadHistoryVideos()
+    }
+  }, [refreshTasks, loadHistoryVideos])
+
+  // 定时轮询（只有活跃任务时才轮询）
+  useEffect(() => {
+    const hasActive = tasks.some(t => t.status === 'running' || t.status === 'pending')
+    
+    // 有活跃任务时才启动轮询
+    if (hasActive) {
+      pollingRef.current = setInterval(() => {
+        refreshTasks()
+      }, 1000)
+    }
+    
     return () => {
       if (pollingRef.current) clearInterval(pollingRef.current)
     }
-  }, [refreshTasks])
+  }, [refreshTasks, tasks])
 
-  // 上传并提交任务
+  // 第一步：上传并解析 PDF 章节
   const handleSubmit = async (file: File, skipLlm: boolean, pages: string) => {
     setUploading(true)
     setError(null)
     try {
+      const form = new FormData()
+      form.append('pdf', file)
+      if (pages) form.append('pages', pages)
+
+      const res = await fetch(API('parse'), { method: 'POST', body: form })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || '解析失败')
+
+      // 保存结果和参数，展示预览弹窗
+      setParseResult(data)
+      setPendingFile({ file, skipLlm, pages })
+    } catch (e: any) {
+      setError(e.message)
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  // 第二步：确认后提交生成任务
+  const handleConfirmGenerate = async () => {
+    if (!pendingFile) return
+    setParseResult(null)
+    setUploading(true)
+    try {
+      const { file, skipLlm, pages } = pendingFile
       const form = new FormData()
       form.append('pdf', file)
       form.append('skip_llm', String(skipLlm))
@@ -553,17 +922,32 @@ export default function Home() {
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail || '提交失败')
 
-      // 立即刷新任务列表
       await refreshTasks()
     } catch (e: any) {
       setError(e.message)
     } finally {
       setUploading(false)
+      setPendingFile(null)
     }
+  }
+
+  // 取消预览
+  const handleCancelPreview = () => {
+    setParseResult(null)
+    setPendingFile(null)
   }
 
   const activeTasks = tasks.filter(t => t.status === 'running' || t.status === 'pending')
   const doneTasks = tasks.filter(t => t.status === 'completed' || t.status === 'failed')
+
+  // 历史视频：过滤掉已在 tasks 中存在的（避免重复展示）
+  const taskOutputPaths = new Set(tasks.map(t => t.output_path).filter(Boolean))
+  const orphanVideos = historyVideos.filter(v => !taskOutputPaths.has(v.output_path))
+
+  // 删除历史视频（仅从前端列表移除，实际文件由后端删除）
+  const handleDeleteHistoryVideo = useCallback((outputPath: string) => {
+    setHistoryVideos(prev => prev.filter(v => v.output_path !== outputPath))
+  }, [])
 
   // 取消任务后刷新列表
   const handleCancel = useCallback(async (_taskId: string) => {
@@ -573,6 +957,13 @@ export default function Home() {
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
       <ConfigModal open={configOpen} onClose={() => setConfigOpen(false)} />
+      {parseResult && (
+        <ChapterPreview
+          result={parseResult}
+          onConfirm={handleConfirmGenerate}
+          onCancel={handleCancelPreview}
+        />
+      )}
       {/* 顶部导航 */}
       <header className="border-b border-slate-800/60 bg-slate-900/80 backdrop-blur sticky top-0 z-10">
         <div className="max-w-4xl mx-auto px-4 h-14 flex items-center justify-between">
@@ -647,8 +1038,13 @@ export default function Home() {
           </section>
         )}
 
+        {/* 历史视频（后端重启后从 output 目录恢复） */}
+        {orphanVideos.length > 0 && (
+          <HistoryVideoSection videos={orphanVideos} onDelete={handleDeleteHistoryVideo} />
+        )}
+
         {/* 空状态 */}
-        {tasks.length === 0 && !uploading && (
+        {tasks.length === 0 && orphanVideos.length === 0 && !uploading && (
           <div className="text-center py-16 text-slate-600">
             <svg className="w-12 h-12 mx-auto mb-3 opacity-40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
               <polygon points="23 7 16 12 23 17 23 7"/>
