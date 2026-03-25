@@ -709,7 +709,7 @@ function UploadZone({ onSubmit, uploading }: {
     e.preventDefault()
     setDragging(false)
     const f = e.dataTransfer.files[0]
-    if (f?.name.endsWith('.pdf')) setFile(f)
+    if (f && (f.name.endsWith('.pdf') || f.name.endsWith('.md'))) setFile(f)
   }, [])
 
   const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -739,7 +739,7 @@ function UploadZone({ onSubmit, uploading }: {
         <input
           ref={inputRef}
           type="file"
-          accept=".pdf"
+          accept=".pdf,.md"
           className="hidden"
           onChange={handleFile}
         />
@@ -773,8 +773,8 @@ function UploadZone({ onSubmit, uploading }: {
                 <line x1="12" y1="3" x2="12" y2="15"/>
               </svg>
             </div>
-            <p className="text-sm text-slate-300 font-medium">拖拽 PDF 到此处，或点击选择</p>
-            <p className="text-xs text-slate-500 mt-1">支持金融研报、分析报告等 PDF 文件</p>
+            <p className="text-sm text-slate-300 font-medium">拖拽 PDF 或 Markdown 到此处，或点击选择</p>
+            <p className="text-xs text-slate-500 mt-1">支持金融研报、分析报告等 PDF 或 Markdown 文件</p>
           </div>
         )}
       </div>
@@ -889,7 +889,7 @@ export default function Home() {
     setError(null)
     try {
       const form = new FormData()
-      form.append('pdf', file)
+      form.append('file', file)
       if (pages) form.append('pages', pages)
 
       const res = await fetch(API('parse'), { method: 'POST', body: form })
@@ -914,7 +914,7 @@ export default function Home() {
     try {
       const { file, skipLlm, pages } = pendingFile
       const form = new FormData()
-      form.append('pdf', file)
+      form.append('file', file)
       form.append('skip_llm', String(skipLlm))
       if (pages) form.append('pages', pages)
 
@@ -1002,7 +1002,7 @@ export default function Home() {
         <section>
           <div className="mb-4">
             <h2 className="text-lg font-semibold text-slate-100">上传金融报告</h2>
-            <p className="text-sm text-slate-500 mt-0.5">支持 PDF 格式，自动解析并生成带语音讲解的视频</p>
+            <p className="text-sm text-slate-500 mt-0.5">支持 PDF 或 Markdown 格式，自动解析并生成带语音讲解的视频</p>
           </div>
           <div className="bg-slate-800/40 border border-slate-700/60 rounded-2xl p-6">
             <UploadZone onSubmit={handleSubmit} uploading={uploading} />

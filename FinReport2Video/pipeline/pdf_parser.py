@@ -510,9 +510,20 @@ def _extract_title_with_llm(page_text: str, page_num: int) -> str:
                 }
             ],
             max_tokens=30,
-            temperature=0,
+            temperature=1,
         )
-        result = response.choices[0].message.content.strip() if response.choices[0].message.content else ""
+        # 处理 GLM 等模型的 reasoning_content 情况
+        message = response.choices[0].message
+        if message.content:
+            result = message.content.strip()
+        elif hasattr(message, 'reasoning_content') and message.reasoning_content:
+            result = message.reasoning_content.strip()
+        else:
+            result = ""
+        
+        # 移除可能的 <think> 标签内容
+        result = re.sub(r'<think>.*?</think>', '', result, flags=re.DOTALL)
+        result = re.sub(r'<thinking>.*?</thinking>', '', result, flags=re.DOTALL)
         
         # 如果 LLM 返回 NONE，表示不是新章节
         if "NONE" in result.upper() or not result:

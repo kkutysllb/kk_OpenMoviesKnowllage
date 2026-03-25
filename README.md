@@ -3,7 +3,7 @@
 本仓库包含两个子项目：
 
 - **FinReport2Video** — 自研金融报告转视频工具
-- **OpenMAIC** — 开源 AI 课堂框架（基于原仓库二次定制）
+- **KKMAIC** — 【KK】量化课堂（基于 OpenMAIC 二次定制）
 
 ---
 
@@ -95,11 +95,11 @@ QWEN_IMAGE_API_KEY=sk-xxx
 
 ---
 
-## OpenMAIC
+## KKMAIC
 
 ### 项目简介
 
-[OpenMAIC](https://github.com/THU-MAIC/OpenMAIC) 是清华大学开源的多智能体 AI 课堂框架，将任意话题或文档生成交互式课堂内容（PPT、测验、模拟、白板讲解等）。本仓库在原版基础上做了以下本地化定制。
+【KK】量化课堂是基于 [OpenMAIC](https://github.com/THU-MAIC/OpenMAIC) 二次定制的多智能体 AI 课堂框架，将任意话题或文档生成交互式课堂内容（PPT、测验、模拟、白板讲解等）。本仓库在原版基础上做了以下本地化定制。
 
 ### 相对原版的修改内容
 
@@ -137,7 +137,7 @@ QWEN_IMAGE_API_KEY=sk-xxx
 ### 本地启动
 
 ```bash
-cd OpenMAIC
+cd KKMAIC
 npm install -g pnpm   # 若未安装
 pnpm install
 pnpm dev              # 访问 http://localhost:3000
@@ -150,6 +150,6 @@ pnpm dev              # 访问 http://localhost:3000
 ```
 kk_OpenMoviesKnowllage/
 ├── FinReport2Video/    # 自研：金融报告转视频工具
-├── OpenMAIC/           # 开源框架：多智能体 AI 课堂（本地定制版）
+├── KKMAIC/             # 【KK】量化课堂（基于 OpenMAIC 定制）
 └── README.md
 ```

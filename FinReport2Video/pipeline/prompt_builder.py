@@ -46,6 +46,30 @@ _DEFAULT_PROMPT = (
     "镜头缓慢推进，科技感强，专业金融氛围，无人脸，无文字"
 )
 
+
+def _extract_final_output(text: str) -> str:
+    """
+    提取 LLM 输出中的最终结果，过滤掉思考过程。
+    处理格式如：<think>...</think> 或 <thinking>...</thinking>
+    """
+    # 移除 <think> 标签内的内容
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    # 移除 <thinking> 标签内的内容
+    text = re.sub(r'<thinking>.*?</thinking>', '', text, flags=re.DOTALL)
+    # 如果有多行，取最后一行非空内容（思考过程通常在前面）
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    if lines:
+        # 检查是否包含明显的思考关键词
+        skip_keywords = ['思考', '分析', '推理', '让我', '首先', '其次', '第一', '第二']
+        # 从后往前找第一个不像思考的行
+        for line in reversed(lines):
+            if not any(kw in line for kw in skip_keywords) and len(line) > 10:
+                return line
+        # 如果都像思考，返回最后一行
+        return lines[-1]
+    return text
+
+
 # ── LLM Prompt 系统词 ──────────────────────────────────────────────────────────
 
 _SYSTEM_PROMPT = """你是专业的金融视频 prompt 工程师。
@@ -94,9 +118,12 @@ def _build_with_llm(content: str) -> str:
             {"role": "user", "content": f"页面内容：{user_input}"},
         ],
         max_tokens=100,
-        temperature=0.7,
+        temperature=1,
     )
-    return resp.choices[0].message.content.strip()
+    result = resp.choices[0].message.content.strip()
+    # 过滤可能的思考过程
+    result = _extract_final_output(result)
+    return result
 
 
 def _build_with_template(content: str) -> str:

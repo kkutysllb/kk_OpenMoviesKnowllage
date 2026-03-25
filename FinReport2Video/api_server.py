@@ -265,14 +265,23 @@ def health():
 
 
 @app.post("/api/parse")
-async def parse_pdf_chapters(
-    pdf: UploadFile = File(...),
+async def parse_chapters(
+    file: UploadFile = File(...),
     pages: Optional[str] = Form(None),
 ):
-    """上传 PDF 并解析章节标题列表（用于前端动画展示）"""
-    if not pdf.filename.endswith(".pdf"):
-        raise HTTPException(400, "只支持 PDF 文件")
+    """上传 PDF 或 Markdown 并解析章节标题列表（用于前端动画展示）"""
+    filename = file.filename.lower()
+    
+    if filename.endswith(".pdf"):
+        return await _parse_pdf_chapters(file, pages)
+    elif filename.endswith(".md") or filename.endswith(".markdown"):
+        return await _parse_markdown_chapters(file)
+    else:
+        raise HTTPException(400, "只支持 PDF 或 Markdown 文件")
 
+
+async def _parse_pdf_chapters(pdf: UploadFile, pages: Optional[str]):
+    """PDF 解析逻辑"""
     # 保存临时文件
     os.makedirs(TEMP_DIR, exist_ok=True)
     tmp_name = f"parse_{int(time.time())}_{pdf.filename}"
@@ -295,7 +304,8 @@ async def parse_pdf_chapters(
         return {
             "filename": pdf.filename,
             "total_pages": len(chapters),
-            "chapters": chapters
+            "chapters": chapters,
+            "file_type": "pdf"
         }
     except Exception as e:
         raise HTTPException(500, f"解析失败: {str(e)}")
@@ -307,16 +317,65 @@ async def parse_pdf_chapters(
             pass
 
 
+async def _parse_markdown_chapters(md: UploadFile):
+    """Markdown 解析逻辑"""
+    from pipeline.markdown_parser import parse_markdown
+    
+    # 保存临时文件
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    tmp_name = f"parse_{int(time.time())}_{md.filename}"
+    md_path = os.path.join(TEMP_DIR, tmp_name)
+    content = await md.read()
+    with open(md_path, "wb") as f:
+        f.write(content)
+
+    try:
+        # 调用 Markdown 解析
+        sections = parse_markdown(md_path)
+        chapters = [
+            {
+                "page_num": s.order,
+                "title": s.title or f"第 {s.order} 章",
+                "preview": s.content[:80] + "..." if len(s.content) > 80 else s.content,
+                "tables_count": len(s.tables)
+            }
+            for s in sections
+        ]
+        return {
+            "filename": md.filename,
+            "total_pages": len(chapters),
+            "chapters": chapters,
+            "file_type": "markdown"
+        }
+    except Exception as e:
+        raise HTTPException(500, f"解析失败: {str(e)}")
+    finally:
+        # 清理临时文件
+        try:
+            os.remove(md_path)
+        except Exception:
+            pass
+
+
 @app.post("/api/generate")
 async def generate_video(
-    pdf: UploadFile = File(...),
+    file: UploadFile = File(...),
     skip_llm: bool = Form(False),
     pages: Optional[str] = Form(None),
 ):
-    """上传 PDF 并启动视频生成任务"""
-    if not pdf.filename.endswith(".pdf"):
-        raise HTTPException(400, "只支持 PDF 文件")
+    """上传 PDF 或 Markdown 并启动视频生成任务"""
+    filename = file.filename.lower()
+    
+    if filename.endswith(".pdf"):
+        return await _generate_pdf_video(file, skip_llm, pages)
+    elif filename.endswith(".md") or filename.endswith(".markdown"):
+        return await _generate_markdown_video(file, skip_llm)
+    else:
+        raise HTTPException(400, "只支持 PDF 或 Markdown 文件")
 
+
+async def _generate_pdf_video(pdf: UploadFile, skip_llm: bool, pages: Optional[str]):
+    """PDF 视频生成"""
     # 读取上传文件内容
     content = await pdf.read()
     
@@ -354,6 +413,39 @@ async def generate_video(
     thread.start()
 
     return {"task_id": task_id, "filename": pdf.filename, "status": TaskStatus.PENDING}
+
+
+async def _generate_markdown_video(md: UploadFile, skip_llm: bool):
+    """Markdown 视频生成"""
+    # 保存文件到 input/
+    os.makedirs(INPUT_DIR, exist_ok=True)
+    safe_name = f"{int(time.time())}_{md.filename}"
+    md_path = os.path.join(INPUT_DIR, safe_name)
+    content = await md.read()
+    with open(md_path, "wb") as f:
+        f.write(content)
+    print(f"    [上传] 保存 Markdown: {md_path}")
+
+    # 创建任务
+    task_id = str(uuid.uuid4())[:8]
+    task = TaskInfo(
+        task_id=task_id,
+        filename=md.filename,
+        pdf_path=md_path,  # 兼容性：使用 pdf_path 字段存储 md 路径
+        created_at=datetime.now().isoformat(),
+    )
+    with TASKS_LOCK:
+        TASKS[task_id] = task
+
+    # 后台线程生成
+    thread = threading.Thread(
+        target=_run_markdown_generation,
+        args=(task_id, md_path, skip_llm),
+        daemon=True,
+    )
+    thread.start()
+
+    return {"task_id": task_id, "filename": md.filename, "status": TaskStatus.PENDING}
 
 
 @app.get("/api/status/{task_id}")
@@ -732,3 +824,96 @@ if __name__ == "__main__":
     os.makedirs(TEMP_DIR, exist_ok=True)
     os.makedirs(INPUT_DIR, exist_ok=True)
     uvicorn.run(app, host="0.0.0.0", port=8765, reload=False)
+
+
+def _run_markdown_generation(task_id: str, md_path: str, skip_llm: bool):
+    """在后台线程中运行 Markdown 视频生成流程"""
+    try:
+        _update_task(task_id, status=TaskStatus.RUNNING, progress=2)
+        _append_log(task_id, f"[{datetime.now().strftime('%H:%M:%S')}] 开始处理 Markdown: {os.path.basename(md_path)}")
+
+        # 确定输出路径
+        md_name = os.path.splitext(os.path.basename(md_path))[0]
+        date_str = datetime.now().strftime("%Y%m%d_%H%M")
+        output_path = os.path.join(OUTPUT_DIR, f"{date_str}_{md_name}.mp4")
+        _update_task(task_id, output_path=output_path)
+
+        # 构建命令
+        cmd = [
+            sys.executable,
+            os.path.join(BASE_DIR, "main.py"),
+            "--input", md_path,
+            "--output", output_path,
+            "--format", "markdown",
+        ]
+        if skip_llm:
+            cmd.append("--skip-llm")
+
+        # 启动子进程
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            cwd=BASE_DIR,
+            env={**os.environ, 'PYTHONUNBUFFERED': '1'},
+        )
+        with PROCS_LOCK:
+            PROCS[task_id] = proc
+
+        # 实时读取输出
+        import select
+        while True:
+            ret = proc.poll()
+            ready, _, _ = select.select([proc.stdout], [], [], 0.1)
+            if proc.stdout in ready:
+                line = proc.stdout.readline()
+                if line:
+                    line = line.rstrip()
+                    if line:
+                        _append_log(task_id, f"[{datetime.now().strftime('%H:%M:%S')}] {line}")
+                        prog = _parse_progress(line)
+                        if prog is not None:
+                            _update_task(task_id, progress=prog)
+            if ret is not None:
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    if line:
+                        _append_log(task_id, f"[{datetime.now().strftime('%H:%M:%S')}] {line}")
+                        prog = _parse_progress(line)
+                        if prog is not None:
+                            _update_task(task_id, progress=prog)
+                break
+
+        with PROCS_LOCK:
+            PROCS.pop(task_id, None)
+
+        with TASKS_LOCK:
+            current_status = TASKS.get(task_id)
+        if current_status and current_status.status == TaskStatus.FAILED and "已取消" in (current_status.error or ""):
+            return
+
+        if proc.returncode == 0 and os.path.exists(output_path):
+            file_size = os.path.getsize(output_path) / (1024 * 1024)
+            _update_task(
+                task_id,
+                status=TaskStatus.COMPLETED,
+                progress=100,
+                completed_at=datetime.now().isoformat(),
+                file_size_mb=round(file_size, 1),
+            )
+            _append_log(task_id, f"[{datetime.now().strftime('%H:%M:%S')}] 视频生成完成！({file_size:.1f} MB)")
+        else:
+            raise RuntimeError(f"进程退出码: {proc.returncode}")
+
+    except Exception as e:
+        with PROCS_LOCK:
+            PROCS.pop(task_id, None)
+        _update_task(
+            task_id,
+            status=TaskStatus.FAILED,
+            error=str(e),
+            completed_at=datetime.now().isoformat(),
+        )
+        _append_log(task_id, f"[{datetime.now().strftime('%H:%M:%S')}] 错误: {e}")

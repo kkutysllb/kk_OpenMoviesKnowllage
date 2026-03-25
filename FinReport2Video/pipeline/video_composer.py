@@ -26,7 +26,7 @@ from moviepy import (
     concatenate_videoclips,
     vfx,
 )
-from config import VIDEO_SIZE, VIDEO_FPS
+from config import VIDEO_SIZE, VIDEO_FPS, DIGITAL_HUMAN_ENABLED, DIGITAL_HUMAN_POSITION, DIGITAL_HUMAN_SIZE, get_digital_human_videos
 
 VW, VH = VIDEO_SIZE  # 1920 x 1080
 
@@ -83,6 +83,7 @@ def compose_page_clip(
     key_points: Optional[List[str]] = None,
     word_timestamps: Optional[List[Dict]] = None,
     screenshot_path: Optional[str] = None,  # PDF第一页截图，显示在左侧上方
+    table_images: Optional[List[str]] = None,  # Markdown表格图片
 ) -> CompositeVideoClip:
     audio = AudioFileClip(audio_path)
     duration = audio.duration
@@ -111,8 +112,10 @@ def compose_page_clip(
     layers.append(VideoClip(lambda t, a=static_arr: a, duration=duration, is_mask=False))
 
     # 4. 右侧图表（滑入 + 轮播）
-    if image_paths:
-        chart_clip = _make_chart_clip(image_paths, duration)
+    # 优先使用 table_images（Markdown表格），否则使用 image_paths
+    display_images = table_images if table_images else image_paths
+    if display_images:
+        chart_clip = _make_chart_clip(display_images, duration)
         if chart_clip:
             layers.append(chart_clip)
 
@@ -122,6 +125,12 @@ def compose_page_clip(
 
     # 7. 进度条
     layers.append(_make_progress_bar(duration))
+
+    # 8. 数字人叠加
+    if DIGITAL_HUMAN_ENABLED:
+        dh_clip = _make_digital_human_clip(duration, page_num)
+        if dh_clip:
+            layers.append(dh_clip)
 
     video = CompositeVideoClip(layers, size=VIDEO_SIZE)
     video = video.with_audio(audio)
@@ -718,6 +727,65 @@ def _make_progress_bar(duration: float) -> VideoClip:
         return canvas
 
     return VideoClip(make_frame, duration=duration, is_mask=False)
+
+
+def _make_digital_human_clip(duration: float, page_num: int = 1) -> Optional[VideoClip]:
+    """
+    数字人叠加层：从素材目录加载视频，循环播放并定位到指定位置
+    
+    Args:
+        duration: 需要的时长
+        page_num: 页码（用于选择不同素材）
+        
+    Returns:
+        VideoClip 或 None（无素材时）
+    """
+    import random
+    
+    # 获取可用的数字人视频
+    dh_videos = get_digital_human_videos()
+    if not dh_videos:
+        return None
+    
+    # 根据页码选择素材（循环使用）
+    video_path = dh_videos[(page_num - 1) % len(dh_videos)]
+    
+    try:
+        # 加载视频
+        dh_clip = VideoFileClip(video_path, has_mask=True)
+        
+        # 计算数字人尺寸和位置
+        dh_width = int(VW * DIGITAL_HUMAN_SIZE)
+        dh_height = int(dh_width * (dh_clip.h / dh_clip.w)) if dh_clip.w > 0 else int(VH * 0.4)
+        
+        # 缩放到目标尺寸
+        dh_clip = dh_clip.resized((dh_width, dh_height))
+        
+        # 循环到目标时长
+        if dh_clip.duration < duration:
+            # 循环播放
+            loops = int(duration / dh_clip.duration) + 1
+            dh_clip = concatenate_videoclips([dh_clip] * loops)
+        dh_clip = dh_clip.subclipped(0, duration)
+        
+        # 计算位置
+        if DIGITAL_HUMAN_POSITION == "bottom-right":
+            pos = (VW - dh_width - 30, VH - dh_height - SUB_AREA_H - 30)
+        elif DIGITAL_HUMAN_POSITION == "bottom-left":
+            pos = (30, VH - dh_height - SUB_AREA_H - 30)
+        elif DIGITAL_HUMAN_POSITION == "top-right":
+            pos = (VW - dh_width - 30, 100)
+        else:  # top-left
+            pos = (30, 100)
+        
+        # 设置位置
+        dh_clip = dh_clip.with_position(pos)
+        
+        return dh_clip
+        
+    except Exception as e:
+        print(f"    [警告] 数字人视频加载失败: {e}")
+        return None
 
 
 # ── 片头页内容（淡入动画）─────────────────────────────────────────────────────
