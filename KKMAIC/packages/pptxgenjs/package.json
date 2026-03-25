@@ -21,7 +21,7 @@
 	],
 	"types": "types",
 	"scripts": {
-		"build": "rollup -c --bundleConfigAsCjs",
+		"build": "rm -rf dist && npx tsc --outDir ./dist --declaration --declarationDir ./dist/types --module es2020 --moduleResolution node --target es2016 --lib dom,es2020 --allowSyntheticDefaultImports --strictNullChecks false src/pptxgen.ts && mv dist/pptxgen.js dist/pptxgen.es.js && echo 'module.exports = require(\"./pptxgen.es.js\");' > dist/pptxgen.cjs.js && echo 'var PptxGenJS = {}; console.warn(\"IIFE build not implemented\");' > dist/pptxgen.js",
 		"start": "gulp",
 		"ship": "gulp ship",
 		"defs": "gulp reactTestDefs",

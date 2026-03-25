@@ -65,8 +65,11 @@ const statusColor: Record<TaskStatus, string> = {
   failed: 'text-red-400 bg-red-400/10 border-red-400/30',
 }
 
-const formatTime = (iso: string) =>
-  new Date(iso).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+const formatTime = (iso: string) => {
+  const d = new Date(iso)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}
 
 // ── 进度条组件 ────────────────────────────────────────────────────────────────
 
@@ -372,11 +375,13 @@ function TaskCard({ task, onRefresh, onCancel }: { task: Task; onRefresh: () => 
   }
 
   const handleCleanup = async () => {
-    if (!confirm('确定要清理该任务的所有临时资源吗？\n清理后将无法再次下载视频。')) return
+    if (!confirm('确定要清理该任务的临时资源吗？\n\n将删除：\n• input/ 中的原始 PDF 文件\n• temp/ 中的临时处理文件（截图、音频、讲稿缓存等）\n\n生成的视频文件不会删除。')) return
     setCleaning(true)
     try {
       const res = await fetch(API(`task/${task.task_id}`), { method: 'DELETE' })
       if (res.ok) {
+        const data = await res.json()
+        console.log('[清理]', data.message, data.cleaned)
         onCancel(task.task_id) // 从列表中移除任务
       }
     } catch {}
@@ -974,7 +979,10 @@ export default function Home() {
                 <rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
               </svg>
             </div>
-            <span className="font-bold text-base tracking-tight">FinReport<span className="text-orange-400">2Video</span></span>
+            <div className="flex items-baseline gap-1.5">
+              <span className="text-xs font-extrabold text-orange-400 tracking-widest bg-orange-400/10 border border-orange-400/30 px-1.5 py-0.5 rounded">KK</span>
+              <span className="font-bold text-base tracking-tight">量化 · FinReport<span className="text-orange-400">2Video</span></span>
+            </div>
           </div>
           <div className="flex items-center gap-2">
             {activeTasks.length > 0 && (

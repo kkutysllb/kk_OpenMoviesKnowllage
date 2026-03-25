@@ -106,6 +106,7 @@ export function Stage({
   const [isRecordingScreen, setIsRecordingScreen] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
+  const recordingAudioContextRef = useRef<AudioContext | null>(null);
 
   const startScreenRecording = useCallback(async () => {
     if (isRecordingScreen) return;
@@ -118,21 +119,42 @@ export function Stage({
     try {
       recordedChunksRef.current = [];
 
+      // Enter fullscreen to hide browser chrome (address bar, tabs, etc.)
+      if (document.documentElement.requestFullscreen) {
+        await document.documentElement.requestFullscreen().catch(() => {
+          // Fullscreen request may be denied — continue recording anyway
+        });
+      }
+
       const stream = await navigator.mediaDevices.getDisplayMedia({
         video: {
           displaySurface: 'browser',
           frameRate: { ideal: 30 },
         } as MediaTrackConstraints,
-        audio: true,
+        audio: false, // We handle audio ourselves via AudioContext
       });
+
+      // Set up AudioContext to capture TTS audio into the recording
+      const audioContext = new AudioContext();
+      const audioDestination = audioContext.createMediaStreamDestination();
+      recordingAudioContextRef.current = audioContext;
+
+      // Route the TTS AudioPlayer through the AudioContext
+      audioPlayerRef.current.connectToContext(audioContext, audioDestination);
+
+      // Combine video track + our captured audio track
+      const combinedStream = new MediaStream([
+        ...stream.getVideoTracks(),
+        ...audioDestination.stream.getAudioTracks(),
+      ]);
 
       let recorder: MediaRecorder;
       try {
-        recorder = new MediaRecorder(stream, {
+        recorder = new MediaRecorder(combinedStream, {
           mimeType: 'video/webm;codecs=vp9,opus',
         });
       } catch {
-        recorder = new MediaRecorder(stream);
+        recorder = new MediaRecorder(combinedStream);
       }
 
       mediaRecorderRef.current = recorder;
@@ -168,9 +190,17 @@ export function Stage({
           toast.success(t('video.recordingSuccess'));
         } finally {
           stream.getTracks().forEach((track) => track.stop());
+          // Disconnect TTS from AudioContext and close it
+          audioPlayerRef.current.disconnectFromContext();
+          recordingAudioContextRef.current?.close().catch(() => {});
+          recordingAudioContextRef.current = null;
           mediaRecorderRef.current = null;
           recordedChunksRef.current = [];
           setIsRecordingScreen(false);
+          // Exit fullscreen when recording stops
+          if (document.fullscreenElement) {
+            document.exitFullscreen().catch(() => {});
+          }
         }
       };
 
@@ -215,6 +245,17 @@ export function Stage({
       void startScreenRecording();
     }
   }, [isRecordingScreen, startScreenRecording, stopScreenRecording]);
+
+  // When user presses ESC and exits fullscreen, stop recording automatically
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      if (!document.fullscreenElement && isRecordingScreen) {
+        stopScreenRecording();
+      }
+    };
+    document.addEventListener('fullscreenchange', handleFullscreenChange);
+    return () => document.removeEventListener('fullscreenchange', handleFullscreenChange);
+  }, [isRecordingScreen, stopScreenRecording]);
 
   // Generate participants from selected agents
   const participants = useMemo(
@@ -547,6 +588,8 @@ export function Stage({
       if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
         mediaRecorderRef.current.stop();
       }
+      audioPlayerRef.current.disconnectFromContext();
+      recordingAudioContextRef.current?.close().catch(() => {});
       audioPlayer.destroy();
       if (discussionAbortRef.current) {
         discussionAbortRef.current.abort();

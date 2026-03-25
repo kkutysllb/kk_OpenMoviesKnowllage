@@ -30,8 +30,9 @@ LLM_BASE_URL = os.getenv("LLM_BASE_URL", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "")
 
 # ── 通义万相图片生成 ────────────────────────────────────────────────────────────
-QWEN_IMAGE_API_KEY = os.getenv("QWEN_IMAGE_API_KEY", "")
-QWEN_IMAGE_BASE_URL = "https://dashscope.aliyuncs.com/api/v1/services/aigc/text2image/image-synthesis"
+QWEN_IMAGE_API_KEY = os.getenv("LLM_API_KEY", "")   # MiniMax 与 LLM 共用同一个 Key
+QWEN_IMAGE_BASE_URL = "https://api.minimaxi.com/v1/image_generation"
+MINIMAX_IMAGE_MODEL = "image-01"
 
 # ── 可灵文生视频（已废弃，改用通义万象）────────────────────────────────────────────
 # KLING_API_KEY 已不再使用，改用 QWEN_IMAGE_API_KEY 调用通义万象 wanx2.1-t2v-turbo

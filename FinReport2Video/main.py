@@ -32,6 +32,9 @@ from pipeline.markdown_parser import parse_markdown, convert_to_page_data
 # 并发度：同时处理的页数（网络 API 并发，不占额外 CPU）
 MAX_CONCURRENT_PAGES = 4
 
+# 是否跳过默认背景文件、强制调用 MiniMax 文生视频
+MINIMAX_VIDEO_ENABLED = os.getenv("MINIMAX_VIDEO_ENABLED", "false").lower() == "true"
+
 
 def _process_pdf(pdf_path: str, pdf_name: str, args) -> list:
     """处理PDF文件，返回视频片段列表"""
@@ -272,9 +275,9 @@ def _process_markdown_section(page, md_name: str, skip_llm: bool, voice: str):
     print(f"  [{tid}] 第 {pn} 章节 ✔ 音频")
 
     # 使用统一背景视频
-    bg_video_path = get_default_bg_video()
+    bg_video_path = get_default_bg_video() if not MINIMAX_VIDEO_ENABLED else None
     if not bg_video_path:
-        # 如果没有默认背景，使用章节内容生成
+        # 开启 MiniMax 模式或没有默认背景，使用章节内容生成
         video_prompt = build_video_prompt(script, page_title=page.title or "")
         bg_video_path = generate_bg_video(
             prompt=video_prompt,
@@ -339,10 +342,10 @@ def _process_page(page, pdf_name, skip_llm, no_ai_image, voice):
         sub_results["images"] = fut_img.result()
         sub_results["audio"]  = fut_tts.result()
 
-    # 使用统一背景视频（与Markdown一致）
-    bg_video_path = get_default_bg_video()
+    # 使用统一背景视频
+    bg_video_path = get_default_bg_video() if not MINIMAX_VIDEO_ENABLED else None
     if not bg_video_path:
-        # 如果没有默认背景，使用页面内容生成
+        # 开启 MiniMax 模式或没有默认背景，使用页面内容生成
         video_prompt = build_video_prompt(script, page_title=page.title or "")
         bg_video_path = generate_bg_video(
             prompt=video_prompt,
@@ -350,7 +353,7 @@ def _process_page(page, pdf_name, skip_llm, no_ai_image, voice):
             pdf_name=pdf_name,
             screenshot_path=page.screenshot_path,
         )
-    print(f"  [{tid}] 第 {pn} 页 ✔ 配图{len(sub_results['images'])}张 / 音频 / 统一背景")
+    print(f"  [{tid}] 第 {pn} 页 ✔ 配图{len(sub_results['images'])}张 / 音频 / 背景")
 
     # 2e. 合成页面视频片段
     word_ts = load_word_timestamps(pn, pdf_name)

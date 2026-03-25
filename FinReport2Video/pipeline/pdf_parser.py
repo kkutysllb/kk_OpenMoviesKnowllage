@@ -156,6 +156,17 @@ def _clean_pdf_text(text: str) -> str:
     return text.strip()
 
 
+# 章节标题常见前缀模式（排除这类内容被误提取为报告标题）
+_SECTION_PREFIX_RE = re.compile(
+    r'^(第[一二三四五六七八九十\d]+[章节部分]|'
+    r'[一二三四五六七八九十]+[、.．]|'
+    r'\d{1,2}[、.．]|'
+    r'[（(]\d+[）)]|'
+    r'附录|摘要|目录|前言|结论|总结)',
+    re.UNICODE
+)
+
+
 def extract_report_meta(pdf_path: str) -> ReportMeta:
     """
     提取报告元信息：
@@ -170,7 +181,10 @@ def extract_report_meta(pdf_path: str) -> ReportMeta:
 
     # ─ 前 2 页：提取标题和摘要 ─
     front_text = ""
-    all_spans = []
+    # page0_spans: 仅第1页的 span（封面，用于标题提取）
+    # page1_spans: 第2页的 span（备用，但降权）
+    page0_spans = []
+    page1_spans = []
     for i in range(min(2, len(doc))):
         page = doc[i]
         front_text += page.get_text() + "\n"
@@ -183,7 +197,10 @@ def extract_report_meta(pdf_path: str) -> ReportMeta:
                     for span in line.get("spans", []):
                         txt = span["text"].strip()
                         if txt and len(txt) > 1:
-                            all_spans.append((span["size"], txt))
+                            if i == 0:
+                                page0_spans.append((span["size"], txt))
+                            else:
+                                page1_spans.append((span["size"], txt))
         except Exception:
             pass
 
@@ -195,17 +212,38 @@ def extract_report_meta(pdf_path: str) -> ReportMeta:
 
     doc.close()
 
-    # 标题：字体最大的文字块
-    if all_spans:
-        all_spans.sort(key=lambda x: -x[0])
-        # 取前3个大字体内容合并为标题
-        top_texts = []
-        for size, txt in all_spans[:6]:
-            if len(txt) > 3 and txt not in top_texts:
-                top_texts.append(txt)
-            if len(top_texts) >= 3:
+    # 标题：优先从第1页（封面）提取，排除章节标题格式
+    # 策略：按字体大小降序，跳过章节前缀 / 过短 / 纯数字的文字块
+    def _pick_title_spans(spans):
+        """从 spans 列表中挑选适合作为报告标题的文字块"""
+        spans_sorted = sorted(spans, key=lambda x: -x[0])
+        picked = []
+        for size, txt in spans_sorted:
+            cleaned = _clean_pdf_text(txt)
+            # 跳过过短文字
+            if len(cleaned) < 3:
+                continue
+            # 跳过纯数字/日期
+            if re.match(r'^[\d\s./-]+$', cleaned):
+                continue
+            # 跳过章节标题格式（如 "一、xxx"、"第一章 xxx"）
+            if _SECTION_PREFIX_RE.match(cleaned):
+                continue
+            # 跳过已收录的重复内容
+            if cleaned in picked:
+                continue
+            picked.append(cleaned)
+            if len(picked) >= 2:
                 break
-        meta.title = _clean_pdf_text("".join(top_texts[:2]))[:60]
+        return picked
+
+    title_parts = _pick_title_spans(page0_spans)
+    # 第1页未能提取到足够内容时，用第2页补充（但第2页内容不单独覆盖第1页结果）
+    if not title_parts and page1_spans:
+        title_parts = _pick_title_spans(page1_spans)
+
+    if title_parts:
+        meta.title = _clean_pdf_text("".join(title_parts[:2]))[:60]
 
     # 分析师：匹配常见模式
     analyst_patterns = [
@@ -331,6 +369,182 @@ def _extract_images(doc: fitz.Document, page: fitz.Page, page_num: int, save_dir
             continue
 
     return image_paths
+
+
+def _get_image_bboxes(doc: fitz.Document, page: fitz.Page) -> List[fitz.Rect]:
+    """
+    获取页面中嵌入图片的位置（bbox），用于区域截图。
+    返回在页面坐标系中的矩形列表（已去重，按面积倒序）。
+    """
+    bboxes = []
+    image_list = page.get_images(full=True)
+
+    for img_info in image_list:
+        xref = img_info[0]
+        try:
+            base_image = doc.extract_image(xref)
+            width = base_image["width"]
+            height = base_image["height"]
+            # 过滤装饰小图
+            if width * height < PDF_MIN_IMAGE_SIZE:
+                continue
+            # 获取图片在页面上的位置（可能有多处引用）
+            rects = page.get_image_rects(xref)
+            for rect in rects:
+                if rect.width > 50 and rect.height > 50:
+                    bboxes.append(rect)
+        except Exception:
+            continue
+
+    # 去重相似区域
+    return _merge_rects(bboxes)
+
+
+def _get_vector_chart_bboxes(page: fitz.Page, min_area: float = 8000.0) -> List[fitz.Rect]:
+    """
+    通过矢量绘图路径检测图表区域（折线图、K线图、柱状图等）。
+    策略：收集所有绘图路径的 bbox，合并密集区域，过滤面积过小的。
+    """
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return []
+
+    if not drawings:
+        return []
+
+    page_rect = page.rect
+    page_area = page_rect.width * page_rect.height
+
+    raw_rects = []
+    for d in drawings:
+        try:
+            r = fitz.Rect(d["rect"])
+            area = r.width * r.height
+            # 过滤：面积太小（装饰线条）或接近全页（背景框）
+            if area < min_area:
+                continue
+            if area > page_area * 0.85:
+                continue
+            # 过滤极细条形（横线/纵线装饰）
+            if r.width < 30 or r.height < 30:
+                continue
+            raw_rects.append(r)
+        except Exception:
+            continue
+
+    if not raw_rects:
+        return []
+
+    return _merge_rects(raw_rects, expand=15.0)
+
+
+def _merge_rects(rects: List[fitz.Rect], expand: float = 5.0) -> List[fitz.Rect]:
+    """
+    合并重叠或相邻的矩形，返回合并后的列表（按面积倒序）。
+    expand：先将每个矩形向外扩展若干点再做重叠判断，使相邻矩形能被合并。
+    """
+    if not rects:
+        return []
+
+    merged = []
+    used = [False] * len(rects)
+
+    for i, r in enumerate(rects):
+        if used[i]:
+            continue
+        group = fitz.Rect(r)
+        for j in range(i + 1, len(rects)):
+            if used[j]:
+                continue
+            expanded = fitz.Rect(
+                rects[j].x0 - expand, rects[j].y0 - expand,
+                rects[j].x1 + expand, rects[j].y1 + expand,
+            )
+            if group.intersects(expanded):
+                group = group | rects[j]  # 合并为包围框
+                used[j] = True
+        merged.append(group)
+
+    # 按面积倒序，最大的图表排在前面
+    merged.sort(key=lambda r: r.width * r.height, reverse=True)
+    return merged
+
+
+def _capture_chart_regions(
+    doc: fitz.Document,
+    page: fitz.Page,
+    page_num: int,
+    save_dir: str,
+    dpi: int = 150,
+    max_charts: int = 4,
+) -> List[str]:
+    """
+    提取页面图表/表格区域的精准截图。
+    先获取内嵌图片位置，再补充矢量图区域，合并后对每个区域截图。
+
+    Returns:
+        截图文件路径列表（可能为空，如纯文字页）
+    """
+    charts_dir = os.path.join(save_dir, "charts")
+    os.makedirs(charts_dir, exist_ok=True)
+
+    page_rect = page.rect
+    page_w = page_rect.width
+    page_h = page_rect.height
+
+    # 1. 收集内嵌图片 bbox（高优先级）
+    img_bboxes = _get_image_bboxes(doc, page)
+
+    # 2. 矢量图表区域（仅在图片数量不足时补充）
+    vec_bboxes: List[fitz.Rect] = []
+    if len(img_bboxes) < 2:
+        vec_bboxes = _get_vector_chart_bboxes(page)
+
+    # 3. 合并两类 bbox，去掉被图片区域覆盖的矢量区域
+    all_bboxes: List[fitz.Rect] = list(img_bboxes)
+    for vr in vec_bboxes:
+        covered = any(
+            (ir & vr).get_area() > vr.get_area() * 0.5
+            for ir in img_bboxes
+        )
+        if not covered:
+            all_bboxes.append(vr)
+
+    # 取面积最大的 max_charts 个区域
+    all_bboxes.sort(key=lambda r: r.width * r.height, reverse=True)
+    all_bboxes = all_bboxes[:max_charts]
+
+    if not all_bboxes:
+        return []
+
+    # 4. 对每个区域做高清截图
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    result_paths: List[str] = []
+
+    for idx, bbox in enumerate(all_bboxes):
+        # 适当扩大截图范围（保留坐标轴/标签）
+        pad = 12
+        clip = fitz.Rect(
+            max(0, bbox.x0 - pad),
+            max(0, bbox.y0 - pad),
+            min(page_w, bbox.x1 + pad),
+            min(page_h, bbox.y1 + pad),
+        )
+        # 过滤太小的区域（宽高各不足 60pt）
+        if clip.width < 60 or clip.height < 60:
+            continue
+
+        try:
+            pix = page.get_pixmap(matrix=mat, clip=clip, alpha=False)
+            out_path = os.path.join(charts_dir, f"page_{page_num:03d}_chart_{idx:02d}.png")
+            pix.save(out_path)
+            result_paths.append(out_path)
+        except Exception as e:
+            print(f"    [警告] 图表区域截图失败 (page={page_num}, idx={idx}): {e}")
+            continue
+
+    return result_paths
 
 
 def _extract_key_points(text: str, max_points: int = 6) -> List[str]:
@@ -692,7 +906,7 @@ def parse_pdf_by_sections(pdf_path: str, pages: Optional[str] = None) -> List[Pa
 
         # 合并所有页的文字
         texts = []
-        all_images: List[str] = []
+        all_images: List[str] = []  # 图表/表格精准截图
         screenshot_path = ""
 
         for arr_idx, page_idx in enumerate(sec["page_indices"]):
@@ -701,13 +915,17 @@ def parse_pdf_by_sections(pdf_path: str, pages: Optional[str] = None) -> List[Pa
 
             texts.append(_extract_text(page))
 
-            # 截图取章节第一页
+            # 截图取章节第一页（左侧缩略图用）
             if arr_idx == 0:
                 screenshot_path = _take_screenshot(page, sec["start_page"], screenshots_dir)
 
-            # 图片汇总所有页
-            imgs = _extract_images(doc, page, page_num, images_dir)
-            all_images.extend(imgs)
+            # 提取图表/表格精准截图（优先截图区域，替代原始嵌入图片字节）
+            chart_shots = _capture_chart_regions(doc, page, page_num, images_dir)
+            if chart_shots:
+                all_images.extend(chart_shots)
+            else:
+                # 降级：直接提取嵌入图片字节（无法检测到矢量图时的兜底）
+                all_images.extend(_extract_images(doc, page, page_num, images_dir))
 
         merged_text = "\n".join(t for t in texts if t)
         key_points = _extract_key_points(merged_text)

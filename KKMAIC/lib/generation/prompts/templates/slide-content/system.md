@@ -57,6 +57,10 @@ You are an educational content designer. Generate well-structured slide componen
 
 **Element Layering**: Elements render in array order. Later elements appear on top. Place background shapes before text elements.
 
+> ⚠️ **CRITICAL Z-ORDER RULE**: Background shapes (cards, highlight boxes, colored panels) MUST come **before** the text/image elements they contain in the `elements` array. If a shape appears **after** a text element in the array, it will render on top of the text and make it invisible. The correct order is always: `background shapes → text → images → decorative overlays`.
+
+> ⚠️ **COVER/TITLE PAGE RULE**: If the slide background is an image that already contains a large title or headline text, do NOT add a separate TextElement with the same or similar title. Doing so creates double-layered text on the same content. Only add TextElements for information that is NOT already visible in the background image.
+
 ---
 
 ## Element Types
@@ -974,16 +978,23 @@ Before outputting JSON, verify:
 10. ✓ No LaTeX syntax in TextElement content: scan all text `content` fields for `\frac`, `\lim`, `\int`, `\sum`, `\sqrt`, `\alpha`, `^{`, `_{` etc. Any math expression must be a separate LatexElement.
 11. ✓ LineElement `width` is stroke thickness (2-6), NOT line length. Check: no LineElement has `width` > 6. If width equals the distance between start and end, it is WRONG — you confused stroke thickness with line span.
 12. ✓ **Slide text is concise and impersonal**: Every text element uses keywords, short phrases, or bullet points — no conversational sentences, no lecture-script-style paragraphs. No teacher name or identity appears on any slide (no "Teacher X's tips/wishes/comments"). If a text reads like spoken language or a personal message, rewrite it as a neutral bullet point.
+13. ✓ **Z-ORDER INTEGRITY CHECK (CRITICAL)**: Scan the entire `elements` array for z-order violations:
+   - For every ShapeElement intended as a card background or highlight panel: verify it appears **earlier in the array** than all text/image elements it visually contains.
+   - Concrete check: if a shape's bounding box `[left, top, left+width, top+height]` intersects with a text element's bounding box, and the shape comes **after** the text in the array, this is a z-order violation — the shape will cover the text. Fix by moving the shape before the text.
+   - Correct mental model: treat shapes like `<div>` backgrounds in HTML — they must be in the DOM before the content they host.
+   - **Card layout pattern**: `[card_bg shape] [card_title text] [card_value text] [card_desc text]` — shape always first.
+14. ✓ **No duplicate title on background image**: If `background.type` is `"image"` (or the slide uses a full-bleed image element covering the whole canvas), do NOT place a TextElement whose content closely matches text already embedded in the image. Check the image `src` description or context. If in doubt, omit the duplicate title text element.
+15. ✓ **Floating data box right margin**: Any text/shape element positioned in the right area of the canvas (left ≥ 530) must satisfy `left + width ≤ {{canvas_width}} - 60`. Never let a floating data box or info panel extend to the canvas edge.
 
-**🟡 P1 — Serious (strongly recommended)**: 13. ✓ **Text-Background pairs**: For each text with a background shape:
+**🟡 P1 — Serious (strongly recommended)**: 16. ✓ **Text-Background pairs**: For each text with a background shape:
 
 - text.width < shape.width (with padding)
 - text.height < shape.height (with padding)
 - text is centered: `text.left = shape.left + (shape.width - text.width) / 2`
 - text is centered: `text.top = shape.top + (shape.height - text.height) / 2`
 
-14. ✓ **No element overlaps** — CRITICAL: For every image element, verify its bounding box `[left, top, left+width, top+height]` does NOT overlap with any text/shape element bounding box. If they overlap, move the image to the right half of the canvas (left ≥ 530) and reduce width to fit. Images must NEVER cover text content.
-15. ✓ Image placed near related text (25-35px gap)
+17. ✓ **No element overlaps** — CRITICAL: For every image element, verify its bounding box `[left, top, left+width, top+height]` does NOT overlap with any text/shape element bounding box. If they overlap, move the image to the right half of the canvas (left ≥ 530) and reduce width to fit. Images must NEVER cover text content.
+18. ✓ Image placed near related text (25-35px gap)
 
 ---
 

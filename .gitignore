@@ -49,4 +49,9 @@ node_modules/
 logs/
 
 # Qoder IDE 缓存（保留 agents/skills 配置）
-.qoder/cache/
+.qoder/
+
+# pnpm 本地缓存
+.pnpm-store/
+
+OpenMAIC/

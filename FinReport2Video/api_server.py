@@ -694,7 +694,7 @@ def download_video(task_id: str):
 
 @app.delete("/api/task/{task_id}")
 def cleanup_task(task_id: str):
-    """清理任务相关的临时资源"""
+    """清理任务相关的所有资源：input PDF + temp 临时目录 + output 视频"""
     import shutil
     
     with TASKS_LOCK:
@@ -704,13 +704,14 @@ def cleanup_task(task_id: str):
         raise HTTPException(404, "任务不存在")
     
     cleaned = []
-    
-    # 清理 temp/{pdf_name}/ 目录
+    errors = []
+
+    # 1. 清理 temp/{pdf_name}/ 目录
+    #    pdf_path 格式： input/{timestamp}_{filename}.pdf
+    #    main.py 会用 os.path.splitext(os.path.basename(pdf_path))[0] 作为 temp 子目录名
+    #    即 temp/{timestamp}_{filename}/，所以这里直接取带时间戳的完整名。
     if task.pdf_path:
         pdf_name = os.path.splitext(os.path.basename(task.pdf_path))[0]
-        # 去掉时间戳前缀 (如 1234567890_filename -> filename)
-        if '_' in pdf_name:
-            pdf_name = pdf_name.split('_', 1)[1]
         temp_dir = os.path.join(TEMP_DIR, pdf_name)
         if os.path.exists(temp_dir):
             try:
@@ -718,25 +719,28 @@ def cleanup_task(task_id: str):
                 cleaned.append(f"temp/{pdf_name}/")
                 print(f"    [清理] 已删除临时目录: {temp_dir}")
             except Exception as e:
+                errors.append(f"temp/{pdf_name}/: {e}")
                 print(f"    [清理] 删除临时目录失败: {e}")
     
-    # 清理 input/ 中的 PDF 文件
+    # 2. 清理 input/ 中的 PDF 文件
     if task.pdf_path and os.path.exists(task.pdf_path):
         try:
             os.remove(task.pdf_path)
             cleaned.append(f"input/{os.path.basename(task.pdf_path)}")
             print(f"    [清理] 已删除输入文件: {task.pdf_path}")
         except Exception as e:
+            errors.append(f"input/{os.path.basename(task.pdf_path)}: {e}")
             print(f"    [清理] 删除输入文件失败: {e}")
-    
-    # 从内存中移除任务
+
+    # 3. 从内存中移除任务
     with TASKS_LOCK:
         TASKS.pop(task_id, None)
     
     return {
         "task_id": task_id,
         "cleaned": cleaned,
-        "message": f"已清理 {len(cleaned)} 项资源"
+        "errors": errors,
+        "message": f"已清理 {len(cleaned)} 项资源" + (f"，{len(errors)} 项失败" if errors else "")
     }
 
 

@@ -1,13 +1,16 @@
 """
 配图模块
 - 优先使用 PDF 中提取的原始图表图片
-- 无图或图片不足时调用通义万相 API 生成金融主题配图
+- 无图或图片不足时调用 MiniMax image-01 API 生成金融主题配图
 """
 import os
-import time
 import requests
 from typing import List, Optional
 from config import QWEN_IMAGE_API_KEY, QWEN_IMAGE_BASE_URL, TEMP_DIR
+try:
+    from config import MINIMAX_IMAGE_MODEL
+except ImportError:
+    MINIMAX_IMAGE_MODEL = "image-01"
 
 
 def get_images_for_page(
@@ -36,8 +39,8 @@ def get_images_for_page(
     if not generate_if_empty:
         return []
 
-    # 调用通义万相生成配图
-    print(f"    第 {page_num} 页无图，调用通义万相生成配图...")
+    # 调用 MiniMax image-01 生成配图
+    print(f"    第 {page_num} 页无图，调用 MiniMax image-01 生成配图...")
     ai_image = _generate_finance_image(page_title, page_num, pdf_name)
     if ai_image:
         return [ai_image]
@@ -51,7 +54,8 @@ def _generate_finance_image(
     pdf_name: str,
 ) -> Optional[str]:
     """
-    调用通义万相文生图 API 生成金融主题配图
+    调用 MiniMax image-01 文生图 API 生成金融主题配图
+    接口为同步接口，直接返回 image_urls，无需轮询
 
     Args:
         topic: 主题关键词（来自页面标题）
@@ -70,71 +74,41 @@ def _generate_finance_image(
     headers = {
         "Authorization": f"Bearer {QWEN_IMAGE_API_KEY}",
         "Content-Type": "application/json",
-        "X-DashScope-Async": "enable",
     }
 
     payload = {
-        "model": "wanx2.1-t2i-turbo",
-        "input": {"prompt": prompt},
-        "parameters": {
-            "size": "1024*576",
-            "n": 1,
-            "style": "<photography>",
-        },
+        "model": MINIMAX_IMAGE_MODEL,
+        "prompt": prompt,
+        "aspect_ratio": "16:9",   # 1280x720，适配视频横屏布局
+        "response_format": "url",
+        "n": 1,
+        "prompt_optimizer": True,
     }
 
     try:
-        # 提交异步任务
-        resp = requests.post(QWEN_IMAGE_BASE_URL, json=payload, headers=headers, timeout=30)
+        resp = requests.post(QWEN_IMAGE_BASE_URL, json=payload, headers=headers, timeout=60)
         if resp.status_code != 200:
-            print(f"    [警告] 通义万相提交失败: {resp.status_code} {resp.text[:200]}")
+            print(f"    [警告] MiniMax 文生图失败: {resp.status_code} {resp.text[:200]}")
             return None
 
-        task_id = resp.json().get("output", {}).get("task_id")
-        if not task_id:
-            print(f"    [警告] 未获取到 task_id")
+        data = resp.json()
+        # 检查业务状态码
+        base_resp = data.get("base_resp", {})
+        if base_resp.get("status_code", 0) != 0:
+            print(f"    [警告] MiniMax 文生图错误: {base_resp.get('status_msg')}")
             return None
 
-        # 轮询等待任务完成
-        image_url = _poll_task(task_id)
-        if not image_url:
+        image_urls = data.get("data", {}).get("image_urls", [])
+        if not image_urls:
+            print(f"    [警告] MiniMax 未返回图片 URL")
             return None
 
-        # 下载图片到本地
-        return _download_image(image_url, page_num, pdf_name)
+        print(f"    MiniMax image-01 生成成功")
+        return _download_image(image_urls[0], page_num, pdf_name)
 
     except Exception as e:
-        print(f"    [警告] 通义万相生成失败: {e}")
+        print(f"    [警告] MiniMax 文生图异常: {e}")
         return None
-
-
-def _poll_task(task_id: str, max_wait: int = 60) -> Optional[str]:
-    """轮询等待通义万相异步任务完成"""
-    poll_url = f"https://dashscope.aliyuncs.com/api/v1/tasks/{task_id}"
-    headers = {"Authorization": f"Bearer {QWEN_IMAGE_API_KEY}"}
-
-    for _ in range(max_wait // 3):
-        time.sleep(3)
-        try:
-            resp = requests.get(poll_url, headers=headers, timeout=15)
-            data = resp.json()
-            status = data.get("output", {}).get("task_status", "")
-
-            if status == "SUCCEEDED":
-                results = data.get("output", {}).get("results", [])
-                if results:
-                    return results[0].get("url")
-                return None
-
-            elif status in ("FAILED", "CANCELED"):
-                print(f"    [警告] 图片生成任务失败: {status}")
-                return None
-
-        except Exception:
-            continue
-
-    print(f"    [警告] 图片生成超时")
-    return None
 
 
 def _download_image(url: str, page_num: int, pdf_name: str) -> Optional[str]:

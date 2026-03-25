@@ -1,24 +1,32 @@
 """
-背景视频生成模块 v2 - 本地 Ken Burns 动效（零 API 费用）
+背景视频生成模块 v3 - 支持 MiniMax 文生视频 + 本地 Ken Burns 两种模式
 
-使用 PDF 页面截图做 Ken Burns 缓动效果：
+优先级：
+  1. MiniMax Hailuo 文生视频（开启 MINIMAX_VIDEO_ENABLED=true 时）
+  2. 本地 Ken Burns 动效（默认，零 API 费用）
+
+MiniMax 文生视频调用流程（异步）：
+  Step1: POST /v1/video_generation → 返回 task_id
+  Step2: GET  /v1/query/video_generation?task_id=xxx → 轮询直到 status=Success 得 file_id
+  Step3: GET  /v1/files/retrieve?file_id=xxx → 获取 download_url 下载 mp4
+
+本地 Ken Burns 动效：
   - 缓慢平移（左→右 或 右→左 交替）
   - 轻微缩放（1.0x → 1.12x）
   - 色调叠加（深蓝/深红等金融色，增强专业感）
-
 片头页专用动态背景：
   - 期指风格 K 线网格背景（纯本地 NumPy 绘制）
   - 数字流下落动效
   - 深蓝渐变，金融专业感
-
-无网络调用，无 API 费用，生成速度快（< 1s）。
 """
 import os
 import sys
+import time
 import hashlib
 import random
 from typing import Optional
 
+import requests
 import numpy as np
 from PIL import Image, ImageFilter, ImageEnhance, ImageDraw
 
@@ -26,6 +34,16 @@ from moviepy import VideoClip
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import VIDEO_SIZE, VIDEO_FPS, BG_VIDEO_FPS
+try:
+    from config import LLM_API_KEY, MINIMAX_IMAGE_MODEL
+except ImportError:
+    LLM_API_KEY = ""
+    MINIMAX_IMAGE_MODEL = "image-01"
+
+# 是否启用 MiniMax 文生视频（默认关闭，防止意外消耗 Token）
+MINIMAX_VIDEO_ENABLED = os.getenv("MINIMAX_VIDEO_ENABLED", "false").lower() == "true"
+MINIMAX_VIDEO_BASE_URL = "https://api.minimaxi.com/v1"
+MINIMAX_VIDEO_MODEL = "MiniMax-Hailuo-2.3-Fast"  # Token Plan 免费配额模型（768P）
 
 VW, VH = VIDEO_SIZE
 
@@ -195,24 +213,145 @@ def _make_futures_intro_clip(duration: float, theme: str) -> VideoClip:
     return VideoClip(make_frame, duration=duration)
 
 
+def _generate_minimax_video(
+    prompt: str,
+    page_num: int,
+    pdf_name: str,
+    temp_dir: str,
+    duration: int = 6,
+) -> Optional[str]:
+    """
+    调用 MiniMax Hailuo 文生视频 API 生成背景视频
+    异步三步驟：提交任务 → 轮询状态 → 获取下载地址
+    """
+    if not LLM_API_KEY:
+        print("    [警告] MiniMax 文生视频：LLM_API_KEY 未配置")
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {LLM_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    # Step1: 提交文生视频任务
+    payload = {
+        "model": MINIMAX_VIDEO_MODEL,
+        "prompt": prompt,
+        "duration": 6 if duration <= 6 else 10,   # Hailuo-2.3 仅支持 6s 或 10s
+        "resolution": "768P",
+        "prompt_optimizer": True,
+    }
+    try:
+        resp = requests.post(
+            f"{MINIMAX_VIDEO_BASE_URL}/video_generation",
+            json=payload,
+            headers=headers,
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            print(f"    [警告] MiniMax 文生视频提交失败: {resp.status_code} {resp.text[:200]}")
+            return None
+
+        data = resp.json()
+        if data.get("base_resp", {}).get("status_code", 0) != 0:
+            print(f"    [警告] MiniMax 文生视频错误: {data['base_resp'].get('status_msg')}")
+            return None
+
+        task_id = data.get("task_id")
+        if not task_id:
+            print("    [警告] MiniMax 文生视频：未返回 task_id")
+            return None
+        print(f"    MiniMax 文生视频任务已提交: task_id={task_id}")
+
+    except Exception as e:
+        print(f"    [警告] MiniMax 文生视频提交异常: {e}")
+        return None
+
+    # Step2: 轮询任务状态（最多等 5 分钟）
+    file_id = None
+    for attempt in range(60):
+        time.sleep(5)
+        try:
+            r = requests.get(
+                f"{MINIMAX_VIDEO_BASE_URL}/query/video_generation",
+                params={"task_id": task_id},
+                headers=headers,
+                timeout=15,
+            )
+            qdata = r.json()
+            status = qdata.get("status", "")
+            if status == "Success":
+                file_id = qdata.get("file_id")
+                print(f"    MiniMax 文生视频生成成功，file_id={file_id}")
+                break
+            elif status == "Fail":
+                print(f"    [警告] MiniMax 文生视频任务失败")
+                return None
+            # Preparing / Queueing / Processing 继续等待
+            if attempt % 6 == 0:
+                print(f"    MiniMax 文生视频生成中... ({attempt * 5}s, status={status})")
+        except Exception:
+            continue
+
+    if not file_id:
+        print("    [警告] MiniMax 文生视频超时")
+        return None
+
+    # Step3: 获取下载地址
+    try:
+        r = requests.get(
+            f"{MINIMAX_VIDEO_BASE_URL}/files/retrieve",
+            params={"file_id": file_id},
+            headers=headers,
+            timeout=15,
+        )
+        fdata = r.json()
+        download_url = fdata.get("file", {}).get("download_url")
+        if not download_url:
+            print("    [警告] MiniMax 未返回 download_url")
+            return None
+    except Exception as e:
+        print(f"    [警告] MiniMax 获取下载地址失败: {e}")
+        return None
+
+    # Step4: 下载 mp4 到本地
+    save_dir = os.path.join(temp_dir, pdf_name, "bg_videos")
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f"page_{page_num:03d}.mp4")
+    try:
+        r = requests.get(download_url, timeout=120)
+        with open(save_path, "wb") as f:
+            f.write(r.content)
+        size_kb = os.path.getsize(save_path) / 1024
+        print(f"    MiniMax 文生视频已保存: {save_path} ({size_kb:.0f} KB)")
+        return save_path
+    except Exception as e:
+        print(f"    [警告] MiniMax 视频下载失败: {e}")
+        return None
+
+
 def generate_bg_video(
     prompt: str,
     page_num: int,
     pdf_name: str,
     temp_dir: str = "temp",
-    duration: int = 5,
+    duration: int = 6,
     screenshot_path: Optional[str] = None,
 ) -> Optional[str]:
     """
-    本地生成背景视频（Ken Burns 动效）。带缓存：已有则直接返回。
+    生成背景视频。带缓存：已有则直接返回。
+
+    优先级：
+      1. MiniMax Hailuo 文生视频（MINIMAX_VIDEO_ENABLED=true 时）
+      2. 本地 Ken Burns 动效（默认）
 
     Args:
-        prompt:          描述文字（用于决定色调，不调用 API）
-        page_num:        页码（用于缓存文件名和方向交替）
+        prompt:          描述文字（用于 MiniMax 提示词或本地色调判断）
+        page_num:        页码（缓存文件名）
         pdf_name:        PDF 名称（缓存目录）
         temp_dir:        临时目录
         duration:        视频时长（秒）
-        screenshot_path: PDF 截图路径（作为背景图源）
+        screenshot_path: PDF 截图路径（本地 Ken Burns 的背景图源）
 
     Returns:
         本地 mp4 文件路径，若失败返回 None
@@ -225,6 +364,15 @@ def generate_bg_video(
         print(f"    背景视频已缓存，跳过生成: {save_path}")
         return save_path
 
+    # 方式 1：MiniMax 文生视频
+    if MINIMAX_VIDEO_ENABLED and LLM_API_KEY:
+        print(f"    调用 MiniMax Hailuo 文生视频...")
+        result = _generate_minimax_video(prompt, page_num, pdf_name, temp_dir, duration)
+        if result:
+            return result
+        print(f"    MiniMax 文生视频失败，降级至本地 Ken Burns")
+
+    # 方式 2：本地 Ken Burns 动效
     print(f"    本地生成背景视频（Ken Burns）...")
 
     try:

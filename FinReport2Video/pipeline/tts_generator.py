@@ -1,10 +1,10 @@
 """
-TTS 语音生成模块 v3
-- 主引擎：阿里云 qwen3-tts-flash（高质量中文语音）
-- 备用引擎：edge-tts（离线，免费）
+TTS 语音生成模块 v4
+- 主引擎：MiniMax speech-2.8-hd（同步 HTTP，高质量中文语音）
+- 备用引擎：edge-tts（免费）
 - 文本清洗：去除 PDF 乱码字、规范化标点、过滤表格行
 - 分段合成：超长文本按句子切片分段调用，音频拼接后整体计时
-- 时间戳：基于字符数 + 标点权重 + 音频时长估算（逐词精度）
+- 时间戟：基于字符数 + 标点权重 + 音频时长估算（逐词精度）
 """
 import os
 import re
@@ -17,11 +17,20 @@ from typing import Optional, List, Dict
 
 import numpy as np
 
-# 阿里云 TTS 配置（与通义万相共用 Key）
-QWEN_TTS_API_KEY = os.getenv("QWEN_API_KEY", "sk-2f709569b1084aeea8d474c1e55d7bc6")
+# 是否开启网络搜索增强模式（与 script_writer.py 共用）
+WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "false").lower() == "true"
+
+# ── MiniMax TTS 配置（主引擎，与 LLM 共用 Key）──────────────────────────────────
+MINIMAX_TTS_API_KEY  = os.getenv("LLM_API_KEY", "")
+MINIMAX_TTS_BASE_URL = "https://api.minimaxi.com/v1/t2a_v2"
+MINIMAX_TTS_MODEL    = "speech-2.8-hd"
+MINIMAX_TTS_VOICE_ID = "female-shaonv"   # 女声，活泼自然；可选: male-qn-qingse(男)、female-yujie(女）
+
+# ── Qwen TTS 备用（已降级，保留兼容）────────────────────────────────────
+QWEN_TTS_API_KEY = os.getenv("QWEN_API_KEY", "")
 QWEN_TTS_URL = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
 QWEN_TTS_MODEL = "qwen3-tts-flash"
-QWEN_TTS_VOICE = "Cherry"   # 女声，清晰专业；可选：Ethan(男)、Serena、Dylan
+QWEN_TTS_VOICE = "Cherry"
 
 # edge-tts 配置（主引擎，免费）
 EDGE_TTS_VOICE = "zh-CN-XiaoxiaoNeural"  # 女声，清晰自然
@@ -174,6 +183,15 @@ def generate_audio(
     output_path = os.path.join(save_dir, f"page_{page_num:03d}.mp3")
     words_path = os.path.join(save_dir, f"page_{page_num:03d}_words.json")
 
+    # WEB_SEARCH_ENABLED 开启时，诅稿已经被强制重新生成（旧缓存已删除）
+    # 对应音频也必须删除，否则时间戳不匹配新讲稿
+    if WEB_SEARCH_ENABLED and page_num > 0:
+        if os.path.exists(output_path):
+            os.remove(output_path)
+            print(f"    [web_search模式] 删除旧音频缓存，重新生成: page_{page_num:03d}.mp3")
+        if os.path.exists(words_path):
+            os.remove(words_path)
+
     if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
         print(f"    音频已存在，跳过生成: {output_path}")
         return output_path
@@ -197,32 +215,48 @@ def generate_audio(
 
     print(f"    原文 {len(text)} 字 → 清洗后 {len(clean_text)} 字")
 
-    # 2. 优先用 edge-tts（免费）
+    # 2. 优先用 MiniMax speech-2.8-hd
     duration = 0.0
     segments = _split_into_segments(clean_text, SEGMENT_MAX_CHARS)
     seg_durations: List[float] = []
 
-    use_voice = voice or EDGE_TTS_VOICE
-    use_rate  = rate or EDGE_TTS_RATE
+    minimax_ok = False
+    if MINIMAX_TTS_API_KEY:
+        try:
+            audio_bytes = _generate_minimax_tts(clean_text)
+            if audio_bytes:
+                with open(output_path, "wb") as f:
+                    f.write(audio_bytes)
+                duration = _get_audio_duration(output_path)
+                total_chars = sum(len(s) for s in segments)
+                for seg in segments:
+                    ratio = len(seg) / total_chars if total_chars > 0 else 1.0 / len(segments)
+                    seg_durations.append(duration * ratio)
+                print(f"    音频生成完成（MiniMax TTS）: {output_path}")
+                minimax_ok = True
+        except Exception as e:
+            print(f"    [MiniMax TTS 失败] {e}，尝试 edge-tts...")
 
-    # edge-tts 一次性合成全文（它自身支持长文本，不需要我们分段）
+    # 3. edge-tts 降级
     edge_ok = False
-    try:
-        asyncio.run(_edge_tts_generate(
-            clean_text, output_path, use_voice, use_rate
-        ))
-        duration = _get_audio_duration(output_path)
-        # 按分段分配时长（按字数比例）
-        total_chars = sum(len(s) for s in segments)
-        for seg in segments:
-            ratio = len(seg) / total_chars if total_chars > 0 else 1.0 / len(segments)
-            seg_durations.append(duration * ratio)
-        print(f"    音频生成完成（edge-tts）: {output_path}")
-        edge_ok = True
-    except Exception as e:
-        print(f"    [edge-tts 失败] {e}，尝试 Qwen TTS 备用...")
+    if not minimax_ok:
+        use_voice = voice or EDGE_TTS_VOICE
+        use_rate  = rate or EDGE_TTS_RATE
+        try:
+            asyncio.run(_edge_tts_generate(
+                clean_text, output_path, use_voice, use_rate
+            ))
+            duration = _get_audio_duration(output_path)
+            total_chars = sum(len(s) for s in segments)
+            for seg in segments:
+                ratio = len(seg) / total_chars if total_chars > 0 else 1.0 / len(segments)
+                seg_durations.append(duration * ratio)
+            print(f"    音频生成完成（edge-tts）: {output_path}")
+            edge_ok = True
+        except Exception as e:
+            print(f"    [edge-tts 失败] {e}，尝试 Qwen TTS 备用...")
 
-    if not edge_ok:
+    if not minimax_ok and not edge_ok:
         # 备用：Qwen TTS 分段合成
         all_audio_bytes: List[bytes] = []
         seg_durations = []
@@ -297,6 +331,57 @@ def load_word_timestamps(page_num: int, pdf_name: str, temp_dir: str = "temp") -
         return []
     with open(words_path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+# ── MiniMax TTS ───────────────────────────────────────────────────────────────
+
+def _generate_minimax_tts(text: str) -> Optional[bytes]:
+    """调用 MiniMax speech-2.8-hd 同步 HTTP TTS，返回 MP3 bytes 或 None"""
+    try:
+        headers = {
+            "Authorization": f"Bearer {MINIMAX_TTS_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": MINIMAX_TTS_MODEL,
+            "text": text,
+            "stream": False,
+            "voice_setting": {
+                "voice_id": MINIMAX_TTS_VOICE_ID,
+                "speed": 1.0,
+                "vol": 1.0,
+                "pitch": 0,
+            },
+            "audio_setting": {
+                "sample_rate": 32000,
+                "bitrate": 128000,
+                "format": "mp3",
+                "channel": 1,
+            },
+            "output_format": "hex",
+            "language_boost": "Chinese",
+        }
+        resp = requests.post(
+            MINIMAX_TTS_BASE_URL, json=payload, headers=headers, timeout=60
+        )
+        if not resp.ok:
+            print(f"    [MiniMax TTS] API 错误: {resp.status_code} {resp.text[:200]}")
+            return None
+        data = resp.json()
+        # 检查业务错误码
+        base_resp = data.get("base_resp", {})
+        status_code = base_resp.get("status_code", 0)
+        if status_code != 0:
+            print(f"    [MiniMax TTS] 业务错误: {status_code} {base_resp.get('status_msg', '')}")
+            return None
+        audio_hex = data.get("data", {}).get("audio", "")
+        if not audio_hex:
+            print(f"    [MiniMax TTS] 响应中无音频数据: {str(data)[:200]}")
+            return None
+        return bytes.fromhex(audio_hex)
+    except Exception as e:
+        print(f"    [MiniMax TTS] 异常: {e}")
+        return None
 
 
 # ── Qwen TTS ──────────────────────────────────────────────────────────────────

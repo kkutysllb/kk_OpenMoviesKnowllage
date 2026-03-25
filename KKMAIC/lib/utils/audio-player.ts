@@ -21,6 +21,64 @@ export class AudioPlayer {
   private volume: number = 1;
   private playbackRate: number = 1;
 
+  // AudioContext routing (used for screen recording to capture TTS audio)
+  private audioContext: AudioContext | null = null;
+  private contextDestination: AudioNode | null = null;
+  private mediaElementSource: MediaElementAudioSourceNode | null = null;
+
+  /**
+   * Connect this player to an AudioContext destination.
+   * Once connected, all audio played through this player will be routed
+   * through the given destination (e.g. MediaStreamDestinationNode for recording).
+   * @param ctx The AudioContext to use
+   * @param destination The destination node (e.g. audioContext.destination or a MediaStreamDestinationNode)
+   */
+  public connectToContext(ctx: AudioContext, destination: AudioNode): void {
+    this.disconnectFromContext();
+    this.audioContext = ctx;
+    this.contextDestination = destination;
+    // If audio is already playing, reconnect immediately
+    if (this.audio) {
+      this._connectCurrentAudio();
+    }
+  }
+
+  /**
+   * Disconnect from AudioContext and revert to default browser audio output.
+   */
+  public disconnectFromContext(): void {
+    if (this.mediaElementSource) {
+      try {
+        this.mediaElementSource.disconnect();
+      } catch {
+        // ignore
+      }
+      this.mediaElementSource = null;
+    }
+    this.audioContext = null;
+    this.contextDestination = null;
+  }
+
+  /**
+   * Connect the current HTMLAudioElement to the AudioContext graph.
+   * Must be called after this.audio is set.
+   */
+  private _connectCurrentAudio(): void {
+    if (!this.audio || !this.audioContext || !this.contextDestination) return;
+    try {
+      // Each HTMLAudioElement can only have one MediaElementSourceNode
+      if (!this.mediaElementSource) {
+        this.mediaElementSource = this.audioContext.createMediaElementSource(this.audio);
+      }
+      // Route: source → context destination (MediaStreamDestination for recording)
+      this.mediaElementSource.connect(this.contextDestination);
+      // Also route to speakers so the user can still hear it
+      this.mediaElementSource.connect(this.audioContext.destination);
+    } catch (error) {
+      log.error('Failed to connect audio to AudioContext:', error);
+    }
+  }
+
   /**
    * Play audio (from URL or IndexedDB pre-generated cache)
    * @param audioId Audio ID
@@ -41,6 +99,8 @@ export class AudioPlayer {
         this.audio.addEventListener('ended', () => {
           this.onEndedCallback?.();
         });
+        // Connect to AudioContext if active (e.g. during screen recording)
+        this._connectCurrentAudio();
         await this.audio.play();
         this.audio.playbackRate = this.playbackRate;
         return true;
@@ -76,6 +136,9 @@ export class AudioPlayer {
         this.onEndedCallback?.();
       });
 
+      // Connect to AudioContext if active (e.g. during screen recording)
+      this._connectCurrentAudio();
+
       // Play
       await this.audio.play();
       // Re-apply after play() — some browsers reset during load
@@ -104,6 +167,15 @@ export class AudioPlayer {
       this.audio.pause();
       this.audio.currentTime = 0;
       this.audio = null;
+    }
+    // Release the MediaElementSourceNode so the next audio element can be connected
+    if (this.mediaElementSource) {
+      try {
+        this.mediaElementSource.disconnect();
+      } catch {
+        // ignore
+      }
+      this.mediaElementSource = null;
     }
     // Note: onEndedCallback intentionally NOT cleared here because play()
     // calls stop() internally — clearing would break the callback chain.
@@ -193,6 +265,7 @@ export class AudioPlayer {
    */
   public destroy(): void {
     this.stop();
+    this.disconnectFromContext();
     this.onEndedCallback = null;
   }
 }

@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "FinReport2Video",
+  title: "【kk 量化】FinReport2Video",
   description: "将金融研报自动生成视频",
 };
 

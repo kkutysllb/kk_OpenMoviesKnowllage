@@ -852,11 +852,6 @@ def _make_intro_content(title, abstract, analyst, date, total_pages, duration, d
         fade  = min(1.0, t / FADE_IN)
         alpha = int(255 * fade)
 
-        # ── 顶部品牌标签 ──
-        draw.rounded_rectangle([VW // 2 - 180, 80, VW // 2 + 180, 130],
-                                radius=8, fill=(200, 80, 15, int(alpha * 0.9)))
-        draw.text((badge_x, 88), badge_text, fill=(255, 255, 255, alpha), font=font_badge)
-
         # ── 主标题 ──
         y_title = title_y_start
         for txt_line, tw, tx in zip(lines, line_tws, line_txs):
