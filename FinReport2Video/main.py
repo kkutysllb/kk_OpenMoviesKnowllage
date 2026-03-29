@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import OUTPUT_DIR, TEMP_DIR
-from pipeline.pdf_parser import parse_pdf, parse_pdf_by_sections, extract_report_meta
+from pipeline.pdf_parser import parse_pdf_smart
 from pipeline.script_writer import write_script, extract_key_points
 from pipeline.image_fetcher import get_images_for_page
 from pipeline.tts_generator import generate_audio, get_available_voices, load_word_timestamps, _get_audio_duration as _get_tts_duration
@@ -37,112 +37,108 @@ MINIMAX_VIDEO_ENABLED = os.getenv("MINIMAX_VIDEO_ENABLED", "false").lower() == "
 
 
 def _process_pdf(pdf_path: str, pdf_name: str, args) -> list:
-    """处理PDF文件，返回视频片段列表"""
-    from pipeline.pdf_parser import extract_report_meta
+    """处理PDF文件，按章节生成视频片段"""
     from pipeline.video_generator import generate_intro_bg_video
     from config import get_default_bg_video
     
-    # ── Step 1: 解析 PDF ───────────────────────────────────────────────────────
-    print("Step 1/5  解析 PDF（按大标题分章节）...")
-    pages_data = parse_pdf_by_sections(pdf_path, pages=args.pages)
-    print(f"  共解析 {len(pages_data)} 页\n")
-
-    # ── Step 1.5: 提取报告元信息，生成片头页 ──────────────────────────────────
-    print("Step 1.5/5  生成片头页...")
-    report_meta = extract_report_meta(pdf_path)
+    # ── Step 1: 智能解析 PDF（按章节）────────────────────────────────────────────
+    print("Step 1/5  智能解析 PDF（识别章节结构）...")
+    report_meta, chapters = parse_pdf_smart(pdf_path, pages=args.pages)
+    print(f"  报告标题: {report_meta.title}")
+    print(f"  报告日期: {report_meta.date}")
+    print(f"  共 {len(chapters)} 个章节\n")
+    
     # 若未能提取到标题，用文件名兜底
     if not report_meta.title:
         report_meta.title = pdf_name
-    report_meta.total_pages = len(pages_data)
-
+    
+    # ── Step 1.5: 生成片头页 ───────────────────────────────────────────────────
+    print("Step 1.5/5  生成片头页...")
+    
     # 使用统一背景视频（与Markdown一致）
     intro_bg_path = get_default_bg_video()
     if not intro_bg_path:
-        # 如果没有默认背景，生成一个
         intro_bg_path = generate_intro_bg_video(
             pdf_name=pdf_name,
             duration=15.0,
         )
-
-    # 片头页旁白（播报报告标题和摘要）
-    # 在关键词之间加停顿逗号，让 TTS 读得更流畅
+    
+    # 片头页旁白
     intro_narration = f"以下是，{report_meta.title}，"
     if report_meta.abstract:
-        intro_narration += report_meta.abstract[:60]
-    if report_meta.analyst:
-        intro_narration += f"。分析师：{report_meta.analyst}"
-    if report_meta.date:
-        intro_narration += f"。发布时间：{report_meta.date}"
-    intro_narration += f"。共{report_meta.total_pages}个章节。"
-
+        intro_narration += report_meta.abstract[:80]
+    intro_narration += f"。发布时间：{report_meta.date}"
+    intro_narration += f"。共{len(chapters)}个章节。"
+    
     intro_audio_path = generate_audio(
         text=intro_narration,
         page_num=0,
         pdf_name=pdf_name,
     )
-    # 片头时长取音频时长（最少 6s，不设上限——充分播完旁白）
     intro_duration = max(6.0, _get_tts_duration(intro_audio_path))
-
+    
     intro_clip = compose_intro_clip(
         bg_video_path=intro_bg_path,
         report_title=report_meta.title,
         report_abstract=report_meta.abstract,
         analyst=report_meta.analyst,
         date=report_meta.date,
-        total_pages=report_meta.total_pages,
+        total_pages=len(chapters),
         duration=intro_duration,
         audio_path=intro_audio_path,
         data_source=report_meta.data_source,
     )
     print(f"  片头页完成（{report_meta.title[:30]}...）\n")
-
-    # ── Step 2: 逐页处理 ───────────────────────────────────────────────────────
-    print(f"Step 2/5  并发处理 {len(pages_data)} 页（最多 {MAX_CONCURRENT_PAGES} 页同时）...")
+    
+    # ── Step 2: 逐章节处理 ─────────────────────────────────────────────────────
+    print(f"Step 2/5  并发处理 {len(chapters)} 个章节（最多 {MAX_CONCURRENT_PAGES} 章同时）...")
     t2_start = time.time()
-
+    
     clips_map: dict = {}
     futures_map = {}
-
+    
     with ThreadPoolExecutor(
         max_workers=MAX_CONCURRENT_PAGES,
-        thread_name_prefix="page",
+        thread_name_prefix="sec",
     ) as executor:
-        for page in pages_data:
+        for i, chapter in enumerate(chapters):
             fut = executor.submit(
-                _process_page,
-                page,
+                _process_pdf_section,
+                chapter,
                 pdf_name,
                 args.skip_llm,
                 args.no_ai_image,
                 args.voice,
+                i + 1,  # 传入章节索引
             )
-            futures_map[fut] = page.page_num
-
+            futures_map[fut] = i + 1
+        
         for fut in as_completed(futures_map):
-            pn = futures_map[fut]
+            sec_num = futures_map[fut]
             try:
-                page_num, clip = fut.result()
-                clips_map[page_num] = clip
+                section_num, clip = fut.result()
+                clips_map[section_num] = clip
                 elapsed_so_far = time.time() - t2_start
                 done = len(clips_map)
-                total = len(pages_data)
-                print(f"  进度: {done}/{total} 页完成 ({elapsed_so_far:.0f}s 已耗)", flush=True)
+                total = len(chapters)
+                print(f"  进度: {done}/{total} 章节完成 ({elapsed_so_far:.0f}s 已耗)", flush=True)
             except Exception as e:
-                print(f"  [错误] 第 {pn} 页处理失败: {e}")
-
-    # 按原始页面顺序拼接 clips
-    page_clips = [intro_clip]
-    for page in pages_data:
-        clip = clips_map.get(page.page_num)
+                print(f"  [错误] 第 {sec_num} 章节处理失败: {e}")
+    
+    # 按原始章节顺序拼接 clips
+    chapter_clips = [intro_clip]
+    for i, chapter in enumerate(chapters):
+        section_index = i + 1
+        clip = clips_map.get(section_index)
         if clip is not None:
-            page_clips.append(clip)
+            chapter_clips.append(clip)
         else:
-            print(f"  [警告] 第 {page.page_num} 页处理失败，跳过")
-
+            print(f"  [警告] 第 {section_index} 章节处理失败，跳过")
+    
     t2_elapsed = time.time() - t2_start
     print(f"  Step 2 完成，共耗时 {t2_elapsed:.0f}s\n")
     
-    return page_clips
+    return chapter_clips
 
 
 def _process_markdown(md_path: str, md_name: str, args) -> list:
@@ -152,13 +148,28 @@ def _process_markdown(md_path: str, md_name: str, args) -> list:
     # ── Step 1: 解析 Markdown ───────────────────────────────────────────────────
     print("Step 1/4  解析 Markdown（按标题分章节）...")
     from config import TEMP_DIR
-    sections = parse_markdown(md_path)
-    pages_data = convert_to_page_data(sections, TEMP_DIR)
+    metadata, sections = parse_markdown(md_path)
+    
+    # 获取 Markdown 文件目录（用于解析相对图片路径）
+    md_dir = os.path.dirname(os.path.abspath(md_path))
+    
+    # 转换为 PageData，传入文件名用于创建子目录
+    pages_data = convert_to_page_data(
+        sections, 
+        TEMP_DIR, 
+        md_name=md_name,
+        md_path=md_path,
+        cover_image=metadata.cover_image,
+        md_dir=md_dir
+    )
+    print(f"  文档标题: {metadata.title or md_name}")
+    print(f"  文档日期: {metadata.date or '未知'}")
+    print(f"  封面图片: {'已提取' if metadata.cover_image else '无'}")
     print(f"  共解析 {len(pages_data)} 个章节\n")
 
     # ── Step 1.5: 生成片头页 ───────────────────────────────────────────────────
     print("Step 1.5/4  生成片头页...")
-    report_title = sections[0].title if sections else md_name
+    report_title = metadata.title or sections[0].title if sections else md_name
     total_sections = len(pages_data)
 
     # 使用统一背景视频
@@ -171,7 +182,13 @@ def _process_markdown(md_path: str, md_name: str, args) -> list:
         )
 
     # 片头页旁白
-    intro_narration = f"以下是，{report_title}，共{total_sections}个章节。"
+    intro_narration = f"以下是，{report_title}，"
+    if metadata.abstract:
+        # 完整朗读摘要内容（增加长度限制以确保完整性）
+        intro_narration += metadata.abstract[:300]
+    if metadata.date:
+        intro_narration += f"。本文发布日期：{metadata.date}。"
+    intro_narration += f"接下来让我们一起了解，共{total_sections}个章节的详细内容。"
 
     intro_audio_path = generate_audio(
         text=intro_narration,
@@ -183,13 +200,14 @@ def _process_markdown(md_path: str, md_name: str, args) -> list:
     intro_clip = compose_intro_clip(
         bg_video_path=intro_bg_path,
         report_title=report_title,
-        report_abstract="",
-        analyst="",
-        date="",
+        report_abstract=metadata.abstract,
+        analyst=metadata.author,
+        date=metadata.date,
         total_pages=total_sections,
         duration=intro_duration,
         audio_path=intro_audio_path,
-        data_source="",
+        data_source=metadata.data_source,
+        cover_image=pages_data[0].screenshot_path if pages_data else "",
     )
     print(f"  片头页完成（{report_title[:30]}...）\n")
 
@@ -253,9 +271,43 @@ def _process_markdown_section(page, md_name: str, skip_llm: bool, voice: str):
     # 从 page 获取原始表格数据（如果存在）
     tables = getattr(page, 'tables', None)
     
-    # 生成讲稿（传入表格数据）
+    # 获取表格图片（渲染后的表格图片）
+    table_images = getattr(page, 'table_images', [])
+
+    # 获取图表图片（章节内的图片）
+    chart_images = page.image_paths if page.image_paths else []
+
+    # ── 空图片占位：使用 AI 生成 ─────────────────────────────────────────────
+    # 右侧表格区无图时，生成表格占位图
+    if not table_images:
+        placeholder = get_images_for_page(
+            page_num=pn,
+            pdf_images=[],
+            page_title=f"{page.title or '数据表格'}",
+            pdf_name=md_name,
+            generate_if_empty=True,
+        )
+        if placeholder:
+            table_images = placeholder
+            print(f"  [{tid}] 第 {pn} 章节 ✔ AI表格占位图")
+
+    # 左侧图表区无图时，生成图表占位图
+    if not chart_images:
+        placeholder = get_images_for_page(
+            page_num=pn,
+            pdf_images=[],
+            page_title=f"{page.title or '数据分析'}",
+            pdf_name=md_name,
+            generate_if_empty=True,
+        )
+        if placeholder:
+            chart_images = placeholder
+            print(f"  [{tid}] 第 {pn} 章节 ✔ AI图表占位图")
+    
+    # 生成讲稿（传入表格数据和章节序号）
     script = write_script(page.text, page_title=page.title, skip_llm=skip_llm,
-                          pdf_name=md_name, page_num=pn, tables=tables)
+                          pdf_name=md_name, page_num=pn, tables=tables,
+                          section_index=page.page_num)
     print(f"  [{tid}] 第 {pn} 章节 ✔ 讲稿 ({len(script)}字)")
     
     # 提取关键要点（用于左侧信息卡展示）
@@ -287,21 +339,106 @@ def _process_markdown_section(page, md_name: str, skip_llm: bool, voice: str):
         )
     print(f"  [{tid}] 第 {pn} 章节 ✔ 背景视频")
 
-    # 合成页面视频片段（表格图片在 page.image_paths 中）
+    # 合成页面视频片段
+    # - 左侧：图表图片轮播
+    # - 右侧：表格图片轮播
     word_ts = load_word_timestamps(pn, md_name)
     clip = compose_page_clip(
         bg_video_path=bg_video_path,
         audio_path=audio_path,
-        image_paths=page.image_paths,  # 包含表格图片
+        image_paths=chart_images,          # 图表图片
+        chart_images=chart_images,         # 左侧图表轮播
+        table_images=table_images,         # 右侧表格轮播
         script_text=script,
         page_num=pn,
         page_title=page.title or "",
-        key_points=key_points if key_points else page.key_points,  # 使用LLM提取的要点
+        key_points=key_points if key_points else page.key_points,
         word_timestamps=word_ts,
-        screenshot_path=None,
+        screenshot_path=page.screenshot_path,  # 封面截图
     )
     print(f"  [{tid}] 第 {pn} 章节 ✔ 视频片段合成完成")
     return pn, clip
+
+
+def _process_pdf_section(chapter, pdf_name: str, skip_llm: bool, no_ai_image: bool, voice: str, section_index: int):
+    """
+    处理单个PDF章节：LLM讲稿 + 配图 + TTS音频 + 统一背景视频。
+    返回 (section_index, clip) 元组。
+    """
+    import threading
+    from config import get_default_bg_video
+    
+    tid = threading.current_thread().name
+    section_num = section_index  # 使用传入的章节索引
+    
+    print(f"  [{tid}] 开始处理章节 {section_index}: {chapter.title}")
+
+    # LLM 润色讲稿
+    script = write_script(
+        chapter.content,
+        page_title=chapter.title,
+        skip_llm=skip_llm,
+        pdf_name=pdf_name,
+        page_num=section_num,
+        section_index=section_num
+    )
+    print(f"  [{tid}] 章节「{chapter.title}」✔ 讲稿 ({len(script)}字)")
+
+    # 配图 + TTS 两路并发（优先使用章节内提取的图片）
+    sub_results = {}
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix=f"s{section_num}") as sub:
+        fut_img = sub.submit(
+            get_images_for_page,
+            page_num=section_num,
+            pdf_images=chapter.image_paths,  # 使用章节提取的图片
+            page_title=chapter.title,
+            pdf_name=pdf_name,
+            generate_if_empty=not no_ai_image,
+        )
+        fut_tts = sub.submit(
+            generate_audio,
+            text=script,
+            page_num=section_num,
+            pdf_name=pdf_name,
+            voice=voice,
+        )
+        sub_results["images"] = fut_img.result()
+        sub_results["audio"] = fut_tts.result()
+
+    # 使用统一背景视频
+    bg_video_path = get_default_bg_video() if not MINIMAX_VIDEO_ENABLED else None
+    if not bg_video_path:
+        video_prompt = build_video_prompt(script, page_title=chapter.title or "")
+        bg_video_path = generate_bg_video(
+            prompt=video_prompt,
+            page_num=section_num,
+            pdf_name=pdf_name,
+            screenshot_path=None,
+        )
+    print(f"  [{tid}] 章节「{chapter.title}」✔ 配图{len(sub_results['images'])}张 / 音频 / 背景")
+
+    # 提取关键要点
+    if not skip_llm:
+        key_points = extract_key_points(chapter.content, chapter.title)
+        print(f"  [{tid}] 章节「{chapter.title}」✔ 关键要点 ({len(key_points)}条)")
+    else:
+        key_points = []
+
+    # 合成视频片段
+    word_ts = load_word_timestamps(section_num, pdf_name)
+    clip = compose_page_clip(
+        bg_video_path=bg_video_path,
+        audio_path=sub_results["audio"],
+        image_paths=sub_results["images"],
+        script_text=script,
+        page_num=section_num,
+        page_title=chapter.title or "",
+        key_points=key_points,
+        word_timestamps=word_ts,
+        screenshot_path=None,
+    )
+    print(f"  [{tid}] 章节「{chapter.title}」✔ 视频片段合成完成")
+    return section_index, clip  # 返回章节索引 (1, 2, 3, 4, 5)
 
 
 def _process_page(page, pdf_name, skip_llm, no_ai_image, voice):
@@ -318,7 +455,7 @@ def _process_page(page, pdf_name, skip_llm, no_ai_image, voice):
 
     # 2a. LLM 润色讲稿（串行，后续步骤依赖脚本内容）
     script = write_script(page.text, page_title=page.title, skip_llm=skip_llm,
-                          pdf_name=pdf_name, page_num=pn)
+                          pdf_name=pdf_name, page_num=pn, section_index=pn)
     print(f"  [{tid}] 第 {pn} 页 ✔ 讲稿 ({len(script)}字)")
 
     # 2b/2c. 配图 + TTS 两路并发（背景使用统一视频，不再单独生成）

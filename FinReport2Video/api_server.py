@@ -27,7 +27,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
 from config import OUTPUT_DIR, TEMP_DIR, INPUT_DIR
-from pipeline.pdf_parser import parse_pdf_by_sections
+from pipeline.pdf_parser import parse_pdf_smart
 
 # ── 文件重复检查 ────────────────────────────────────────────────────────────────
 
@@ -281,7 +281,7 @@ async def parse_chapters(
 
 
 async def _parse_pdf_chapters(pdf: UploadFile, pages: Optional[str]):
-    """PDF 解析逻辑"""
+    """PDF 解析逻辑（按章节）"""
     # 保存临时文件
     os.makedirs(TEMP_DIR, exist_ok=True)
     tmp_name = f"parse_{int(time.time())}_{pdf.filename}"
@@ -291,20 +291,28 @@ async def _parse_pdf_chapters(pdf: UploadFile, pages: Optional[str]):
         f.write(content)
 
     try:
-        # 调用 PDF 解析获取章节信息
-        pages_data = parse_pdf_by_sections(pdf_path, pages=pages)
-        chapters = [
+        # 调用智能 PDF 解析（按章节）
+        report_meta, chapters = parse_pdf_smart(pdf_path, pages=pages)
+        
+        # 转换章节格式（使用索引确保 key 唯一）
+        chapters_data = [
             {
-                "page_num": p.page_num,
-                "title": p.title or f"第 {p.page_num} 章",
-                "preview": p.text[:80] + "..." if len(p.text) > 80 else p.text
+                "id": i,  # 使用索引作为唯一 ID
+                "page_num": ch.start_page,
+                "title": ch.title or f"第 {i+1} 章",
+                "preview": ch.content[:80] + "..." if len(ch.content) > 80 else ch.content,
+                "page_count": len(ch.page_indices),
             }
-            for p in pages_data
+            for i, ch in enumerate(chapters)
         ]
+        
         return {
             "filename": pdf.filename,
-            "total_pages": len(chapters),
-            "chapters": chapters,
+            "report_title": report_meta.title,
+            "report_date": report_meta.date,
+            "total_pages": len(chapters),  # 兼容前端
+            "total_chapters": len(chapters),
+            "chapters": chapters_data,
             "file_type": "pdf"
         }
     except Exception as e:
@@ -330,20 +338,26 @@ async def _parse_markdown_chapters(md: UploadFile):
         f.write(content)
 
     try:
-        # 调用 Markdown 解析
-        sections = parse_markdown(md_path)
+        # 调用 Markdown 解析（返回元组：metadata, sections）
+        metadata, sections = parse_markdown(md_path)
         chapters = [
             {
                 "page_num": s.order,
                 "title": s.title or f"第 {s.order} 章",
                 "preview": s.content[:80] + "..." if len(s.content) > 80 else s.content,
-                "tables_count": len(s.tables)
+                "tables_count": len(s.tables),
+                "images_count": len(s.images),
             }
             for s in sections
         ]
         return {
             "filename": md.filename,
+            "report_title": metadata.title,
+            "report_date": metadata.date,
+            "report_abstract": metadata.abstract[:100] if metadata.abstract else "",
+            "cover_image": metadata.cover_image,
             "total_pages": len(chapters),
+            "total_chapters": len(chapters),
             "chapters": chapters,
             "file_type": "markdown"
         }

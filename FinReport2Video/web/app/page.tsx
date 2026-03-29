@@ -7,6 +7,7 @@ import { useState, useRef, useCallback, useEffect } from 'react'
 type TaskStatus = 'pending' | 'running' | 'completed' | 'failed'
 
 interface Chapter {
+  id?: number
   page_num: number
   title: string
   preview: string
@@ -14,6 +15,8 @@ interface Chapter {
 
 interface ParseResult {
   filename: string
+  report_title?: string
+  report_date?: string
   total_pages: number
   chapters: Chapter[]
 }
@@ -275,7 +278,11 @@ function ChapterPreview({
         <div className="flex items-center justify-between px-6 py-4 border-b border-slate-700/60">
           <div>
             <h3 className="font-semibold text-slate-100">文档章节预览</h3>
-            <p className="text-xs text-slate-500 mt-0.5">{result.filename} · 共 {result.total_pages} 章</p>
+            <p className="text-xs text-slate-400 mt-0.5">
+              {result.report_title || result.filename}
+              {result.report_date && <span className="text-slate-500 ml-2">· {result.report_date}</span>}
+              <span className="text-slate-500"> · 共 {result.total_pages} 章</span>
+            </p>
           </div>
           <button onClick={onCancel} className="text-slate-500 hover:text-slate-300 transition-colors">
             <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -288,7 +295,7 @@ function ChapterPreview({
         <div className="flex-1 overflow-y-auto px-6 py-4 space-y-2">
           {result.chapters.map((chapter, idx) => (
             <div
-              key={chapter.page_num}
+              key={chapter.id ?? idx}
               className={`flex items-start gap-3 p-3 rounded-xl border transition-all duration-300 ${
                 idx < visibleCount
                   ? 'opacity-100 translate-y-0 bg-slate-800/60 border-slate-700/40'

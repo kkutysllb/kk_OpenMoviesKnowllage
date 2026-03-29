@@ -5,12 +5,16 @@ PDF 解析模块
 - 生成每页高清截图（作为视频背景底图）
 - 提取报告元信息（标题、摘要、分析师、日期）
 - 使用 LLM 智能识别页面标题
+- 表格结构重组（Typora PDF 碎片化修复）
+- OCR 提取矢量图表文字
 """
 import os
 import re
+import subprocess
+import tempfile
 import fitz  # PyMuPDF
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 from config import PDF_DPI, PDF_MIN_IMAGE_SIZE, TEMP_DIR, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
 
 
@@ -34,6 +38,16 @@ class ReportMeta:
     institution: str = ""    # 机构
     data_source: str = ""    # 数据源
     total_pages: int = 0     # 总页数
+
+
+@dataclass
+class ChapterSection:
+    """章节结构"""
+    title: str = ""                    # 章节标题
+    content: str = ""                  # 章节内容
+    start_page: int = 1                 # 起始页码
+    page_indices: List[int] = field(default_factory=list)  # 包含的页面索引
+    image_paths: List[str] = field(default_factory=list)    # 章节内图片路径列表
 
 
 def parse_pdf(pdf_path: str, pages: Optional[str] = None) -> List[PageData]:
@@ -342,6 +356,63 @@ def _take_screenshot(page: fitz.Page, page_num: int, save_dir: str) -> str:
     return path
 
 
+def _extract_page_images(page: fitz.Page, pdf_path: str, page_idx: int) -> List[str]:
+    """
+    从页面提取图片，返回图片路径列表。
+    用于 parse_pdf_smart 的章节图片提取。
+    """
+    import uuid
+    
+    image_paths = []
+    image_list = page.get_images(full=True)
+    
+    # 确定保存目录
+    base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+    images_dir = os.path.join(TEMP_DIR, f"{base_name}_images")
+    os.makedirs(images_dir, exist_ok=True)
+    
+    doc = page.parent  # 获取所属的 Document
+    
+    for img_idx, img_info in enumerate(image_list):
+        xref = img_info[0]
+        try:
+            base_image = doc.extract_image(xref)
+            img_bytes = base_image["image"]
+            img_ext = base_image["ext"]
+            width = base_image["width"]
+            height = base_image["height"]
+            
+            # 过滤小图和 emoji 图标
+            if width * height < PDF_MIN_IMAGE_SIZE:
+                continue
+            
+            # 过滤 emoji 类小图标：尺寸过小或接近正方形的小图
+            min_dimension = min(width, height)
+            max_dimension = max(width, height)
+            aspect_ratio = max_dimension / min_dimension if min_dimension > 0 else 1
+            
+            # 过滤条件：
+            # 1. 任意边小于 50 像素的小图标
+            # 2. 正方形或接近正方形（宽高比 < 1.2）且面积小于 10000 像素
+            if min_dimension < 50:
+                continue
+            if aspect_ratio < 1.2 and width * height < 10000:
+                continue
+            
+            # 生成唯一文件名
+            unique_id = uuid.uuid4().hex[:8]
+            img_path = os.path.join(images_dir, f"chapter_p{page_idx+1:03d}_{img_idx:02d}_{unique_id}.{img_ext}")
+            
+            with open(img_path, "wb") as f:
+                f.write(img_bytes)
+            
+            image_paths.append(img_path)
+        except Exception as e:
+            print(f"    [警告] 提取图片失败: {e}")
+            continue
+    
+    return image_paths
+
 def _extract_images(doc: fitz.Document, page: fitz.Page, page_num: int, save_dir: str) -> List[str]:
     """提取页面内嵌图片，过滤掉过小的装饰图"""
     image_paths = []
@@ -356,8 +427,18 @@ def _extract_images(doc: fitz.Document, page: fitz.Page, page_num: int, save_dir
             width = base_image["width"]
             height = base_image["height"]
 
-            # 过滤小图（装饰性图标等）
+            # 过滤小图和 emoji 图标（装饰性图标等）
             if width * height < PDF_MIN_IMAGE_SIZE:
+                continue
+            
+            # 过滤 emoji 类小图标：尺寸过小或接近正方形的小图
+            min_dimension = min(width, height)
+            max_dimension = max(width, height)
+            aspect_ratio = max_dimension / min_dimension if min_dimension > 0 else 1
+            
+            if min_dimension < 50:
+                continue
+            if aspect_ratio < 1.2 and width * height < 10000:
                 continue
 
             img_path = os.path.join(save_dir, f"page_{page_num:03d}_img_{img_idx:02d}.{img_ext}")
@@ -385,8 +466,17 @@ def _get_image_bboxes(doc: fitz.Document, page: fitz.Page) -> List[fitz.Rect]:
             base_image = doc.extract_image(xref)
             width = base_image["width"]
             height = base_image["height"]
-            # 过滤装饰小图
+            # 过滤装饰小图和 emoji 图标
             if width * height < PDF_MIN_IMAGE_SIZE:
+                continue
+            
+            # 过滤 emoji 类小图标
+            min_dimension = min(width, height)
+            max_dimension = max(width, height)
+            aspect_ratio = max_dimension / min_dimension if min_dimension > 0 else 1
+            if min_dimension < 50:
+                continue
+            if aspect_ratio < 1.2 and width * height < 10000:
                 continue
             # 获取图片在页面上的位置（可能有多处引用）
             rects = page.get_image_rects(xref)
@@ -400,10 +490,12 @@ def _get_image_bboxes(doc: fitz.Document, page: fitz.Page) -> List[fitz.Rect]:
     return _merge_rects(bboxes)
 
 
-def _get_vector_chart_bboxes(page: fitz.Page, min_area: float = 8000.0) -> List[fitz.Rect]:
+def _get_vector_chart_bboxes(page: fitz.Page, min_area: float = 3000.0) -> List[fitz.Rect]:
     """
     通过矢量绘图路径检测图表区域（折线图、K线图、柱状图等）。
     策略：收集所有绘图路径的 bbox，合并密集区域，过滤面积过小的。
+    
+    优化：降低 min_area 阈值从 8000 到 3000，保留更多小图表。
     """
     try:
         drawings = page.get_drawings()
@@ -421,13 +513,13 @@ def _get_vector_chart_bboxes(page: fitz.Page, min_area: float = 8000.0) -> List[
         try:
             r = fitz.Rect(d["rect"])
             area = r.width * r.height
-            # 过滤：面积太小（装饰线条）或接近全页（背景框）
+            # 降低阈值：保留更多图表
             if area < min_area:
                 continue
             if area > page_area * 0.85:
                 continue
-            # 过滤极细条形（横线/纵线装饰）
-            if r.width < 30 or r.height < 30:
+            # 降低最小尺寸要求
+            if r.width < 20 or r.height < 15:
                 continue
             raw_rects.append(r)
         except Exception:
@@ -913,7 +1005,16 @@ def parse_pdf_by_sections(pdf_path: str, pages: Optional[str] = None) -> List[Pa
             page = doc[page_idx]
             page_num = page_idx + 1
 
-            texts.append(_extract_text(page))
+            # 使用增强版文字提取（表格重组 + OCR）
+            extracted_text = _extract_text_enhanced(page)
+            
+            # 如果是矢量图表页，尝试 OCR 提取图表文字
+            if _is_likely_chart_page(page):
+                ocr_text = _get_text_in_vector_regions(page)
+                if ocr_text:
+                    extracted_text = extracted_text + "\n" + ocr_text
+            
+            texts.append(extracted_text)
 
             # 截图取章节第一页（左侧缩略图用）
             if arr_idx == 0:
@@ -941,3 +1042,605 @@ def parse_pdf_by_sections(pdf_path: str, pages: Optional[str] = None) -> List[Pa
 
     doc.close()
     return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 增强功能：Typora PDF 表格重组 + OCR 矢量图表文字提取
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _extract_text_enhanced(page: fitz.Page) -> str:
+    """
+    增强版文字提取：智能选择最佳提取方式。
+    策略：
+    1. 如果页面是纯文字页，使用普通提取
+    2. 如果页面有表格特征，先尝试表格重组，如果效果不好则回退
+    3. 表格重组应该保留更多原始文字，而不是过度合并
+    """
+    blocks = page.get_text("blocks")
+    
+    # 检查是否有大量碎片化文字（表格特征）
+    short_blocks = 0
+    total_blocks = 0
+    
+    for block in blocks:
+        if block[6] == 0:  # 文字块
+            total_blocks += 1
+            text = block[4].strip()
+            # 1-3个字符的块是碎片化特征
+            if 1 <= len(text) <= 3:
+                short_blocks += 1
+    
+    # 如果短块占比超过 40%，尝试表格重组
+    if total_blocks > 0 and short_blocks / total_blocks > 0.4:
+        reconstructed = _reconstruct_table_text(page)
+        if reconstructed:
+            # 对比原字符数，保留更多字符的版本
+            normal_text = _extract_text(page)
+            if len(reconstructed) >= len(normal_text) * 0.7:
+                print(f"    [表格重组] 原{len(normal_text)}字 → 重组后{len(reconstructed)}字")
+                return reconstructed
+    
+    # 否则用普通提取
+    return _extract_text(page)
+
+
+def _reconstruct_table_text(page: fitz.Page) -> str:
+    """
+    表格结构重组：将碎片化的文字块按位置重新组合成完整单元格。
+    适用于 Typora/Markdown 转 PDF 产生的碎片化表格。
+    
+    策略：
+    1. 收集所有文字片段及其坐标
+    2. 分析 X 坐标分布，识别列边界
+    3. 同一列的文字按 Y 坐标合并为单元格
+    4. 同行单元格用空格连接
+    """
+    try:
+        blocks = page.get_text("dict")["blocks"]
+        
+        # 收集所有文字片段
+        fragments: List[Tuple[float, float, str]] = []  # (x0, y0, text)
+        
+        for block in blocks:
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    text = span["text"].strip()
+                    if not text:
+                        continue
+                    # 跳过纯符号块
+                    if re.match(r'^[█░▓▒■□▪▫~]+$', text):
+                        continue
+                    bbox = span.get("bbox", [])
+                    if len(bbox) == 4:
+                        fragments.append((bbox[0], bbox[1], text))
+        
+        if not fragments:
+            return ""
+        
+        # 分析 X 坐标分布，找列边界
+        x_coords = [f[0] for f in fragments]
+        # 简单的列检测：找 x 坐标的跳跃点
+        x_sorted = sorted(set(x_coords))
+        col_boundaries = []
+        if x_sorted:
+            prev_x = x_sorted[0]
+            for x in x_sorted[1:]:
+                gap = x - prev_x
+                if gap > 20:  # 20pt 以上的间隔认为是列边界
+                    col_boundaries.append((prev_x, x))
+                prev_x = x
+        
+        # 按 Y 分组（行）
+        y_tolerance = 5  # 5pt 容差
+        rows: Dict[int, List[Tuple[float, str]]] = {}
+        for x, y, text in fragments:
+            row_key = int(y / y_tolerance)
+            if row_key not in rows:
+                rows[row_key] = []
+            rows[row_key].append((x, text))
+        
+        # 重建表格
+        result_lines = []
+        for y_key in sorted(rows.keys()):
+            row_fragments = sorted(rows[y_key], key=lambda t: t[0])
+            # 同行片段直接拼接（Typora 的问题是每个字都被拆成独立块）
+            merged = "".join(t[1] for t in row_fragments)
+            # 清理重复的换行
+            merged = re.sub(r'\s+', '', merged)
+            if merged and not re.match(r'^[\d\s.,%\-+]+$', merged):
+                result_lines.append(merged)
+            elif merged and len(merged) > 2:
+                result_lines.append(merged)
+        
+        # 智能合并：检测并连接被断开的单元格
+        final_lines = []
+        i = 0
+        while i < len(result_lines):
+            line = result_lines[i]
+            # 如果当前行很短且下一行也很短，尝试合并
+            if i + 1 < len(result_lines) and len(line) <= 5 and len(result_lines[i+1]) <= 10:
+                merged = line + result_lines[i+1]
+                final_lines.append(merged)
+                i += 2
+            else:
+                final_lines.append(line)
+                i += 1
+        
+        return "\n".join(final_lines)
+    except Exception as e:
+        print(f"    [表格重组失败] {e}")
+        return ""
+
+
+def _ocr_page_region(page: fitz.Page, bbox: fitz.Rect, dpi: int = 200) -> str:
+    """
+    对页面指定区域进行 OCR 文字识别。
+    用于提取矢量图表中的文字。
+    
+    Args:
+        page: fitz.Page 对象
+        bbox: 要 OCR 的区域 (fitz.Rect)
+        dpi: OCR 分辨率
+    
+    Returns:
+        识别出的文字
+    """
+    try:
+        import pytesseract
+        from PIL import Image
+        import io
+        
+        # 确保区域有效且有最小尺寸
+        min_size = 50
+        if bbox.width < min_size or bbox.height < min_size:
+            return ""
+        
+        # 渲染指定区域为图片
+        mat = fitz.Matrix(dpi / 72, dpi / 72)
+        
+        # 添加一些 padding
+        pad = 10
+        clip = fitz.Rect(
+            max(0, bbox.x0 - pad),
+            max(0, bbox.y0 - pad),
+            min(page.rect.width, bbox.x1 + pad),
+            min(page.rect.height, bbox.y1 + pad)
+        )
+        
+        # 确保 clip 有效
+        if clip.width < min_size or clip.height < min_size:
+            return ""
+        
+        pix = page.get_pixmap(matrix=mat, clip=clip, alpha=False)
+        
+        # 转换为 PIL Image
+        img_data = pix.tobytes("png")
+        img = Image.open(io.BytesIO(img_data))
+        
+        # 确保图片尺寸有效
+        if img.width < 20 or img.height < 20:
+            return ""
+        
+        # OCR 识别
+        text = pytesseract.image_to_string(img, lang='chi_sim+eng', config='--psm 6')
+        
+        # 清理结果
+        lines = [l.strip() for l in text.split('\n') if l.strip()]
+        return '\n'.join(lines)
+    except ImportError:
+        return ""
+    except Exception as e:
+        # 静默处理 OCR 错误
+        return ""
+
+
+def _get_text_in_vector_regions(page: fitz.Page) -> str:
+    """
+    提取矢量图表区域内的文字。
+    检测页面上的矢量绘图区域（K线图、柱状图等），
+    对这些区域进行 OCR 提取文字。
+    """
+    try:
+        drawings = page.get_drawings()
+        if not drawings:
+            return ""
+        
+        page_area = page.rect.width * page.rect.height
+        
+        # 收集所有绘图路径的包围框
+        all_rects = []
+        for d in drawings:
+            try:
+                r = fitz.Rect(d["rect"])
+                if r.width > 50 and r.height > 30:
+                    all_rects.append(r)
+            except:
+                continue
+        
+        if not all_rects:
+            return ""
+        
+        # 合并相邻区域
+        merged = _merge_rects(all_rects, expand=10.0)
+        
+        # 取最大的几个区域
+        merged.sort(key=lambda r: r.width * r.height, reverse=True)
+        chart_regions = merged[:3]
+        
+        # 对每个图表区域进行 OCR
+        ocr_texts = []
+        for region in chart_regions:
+            text = _ocr_page_region(page, region, dpi=200)
+            if text and len(text) > 5:
+                ocr_texts.append(text)
+        
+        if ocr_texts:
+            result = "\n".join(ocr_texts)
+            print(f"    [OCR矢量图表] 提取 {len(result)} 字符")
+            return result
+        
+        return ""
+    except Exception as e:
+        print(f"    [矢量图表OCR失败] {e}")
+        return ""
+
+
+def _is_likely_chart_page(page: fitz.Page) -> bool:
+    """
+    判断页面是否可能包含矢量图表（K线图、柱状图等）。
+    """
+    drawings = page.get_drawings()
+    images = page.get_images()
+    
+    # 大量矢量路径 + 少量嵌入图片 = 矢量图表
+    if len(drawings) > 100 and len(images) < 2:
+        return True
+    
+    # 检查是否有进度条字符
+    text = page.get_text()
+    if '█' in text or '░' in text:
+        return True
+    
+    return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 智能章节解析功能
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _is_chapter_heading(text: str, font_size: float, max_font: float) -> bool:
+    """
+    判断文字是否是章节标题。
+    
+    规则：
+    1. 以章节编号开头（一、二、三、1、2、3 等）
+    2. 字体较大（>= max_font * 0.5）
+    3. 长度适中（3-30字符）
+    4. 不是纯数字或纯符号
+    5. 排除表格中的数字（如 26.2、4505.60 等）
+    6. 排除数字开头的总结项（如 "1. 沪深300期货"）
+    """
+    # 排除纯数字（可能是表格数据）
+    if re.match(r'^[\d.,%/]+$', text):
+        return False
+    
+    # 排除太短的数字组合
+    if len(text) <= 4 and re.match(r'^[\d.]+$', text):
+        return False
+    
+    # 章节标题模式
+    chapter_patterns = [
+        r'^[一二三四五六七八九十]+[、.．]',  # 一、二、三、
+        r'^[（(][0-9]+[）)]',               # (1) (2)
+        r'^【[^】]+】',                      # 【标题】
+        r'^第[一二三四五六七八九十0-9]+[章节节部分]',  # 第一章
+    ]
+    
+    for pattern in chapter_patterns:
+        if re.match(pattern, text):
+            return True
+    
+    # 排除数字开头的总结项（这些不是章节，而是列表项）
+    # 例如："1. 沪深300期货"、"2. 中证500期货" 等
+    if re.match(r'^[0-9]+[.．]', text):
+        # 检查是否包含期货品种关键字，如果是则不是章节
+        summary_keywords = ['期货', '持仓', '基差', '评分', '综合']
+        for keyword in summary_keywords:
+            if keyword in text:
+                return False
+        # 数字开头但没有品种关键字，可能是小节标题，也排除以避免碎片化
+        if len(text) > 30:  # 太长，通常是列表项而非标题
+            return False
+    
+    # 常见章节关键词
+    chapter_keywords = [
+        '市场概览', '详细分析', '综合研判', '总结',
+        '贴升贴水', '持仓分析', '成交量', '行情回顾',
+        '技术分析', '基本面', '操作建议', '风险提示',
+        '宏观分析', '行业分析', '个股分析',
+        '数据解读', '市场情绪', '资金流向',
+        '投资建议', '操作策略', '行情研判',
+    ]
+    
+    # 字体较大且包含章节关键词，且不是纯数字
+    if font_size >= max_font * 0.5 and len(text) >= 3 and len(text) <= 30:
+        # 排除以数字开头的
+        if not re.match(r'^[\d]', text):
+            for keyword in chapter_keywords:
+                if keyword in text:
+                    return True
+    
+    return False
+
+
+def _merge_adjacent_spans(line: dict) -> str:
+    """
+    合并一行中相邻的 span，保留所有文字。
+    用于处理章节标题被拆分成多个 span 的情况。
+    """
+    spans = line.get('spans', [])
+    if not spans:
+        return ""
+    
+    # 按 x0 坐标排序
+    sorted_spans = sorted(spans, key=lambda s: s.get('bbox', [0])[0])
+    
+    # 合并文字
+    merged = ''.join(span['text'] for span in sorted_spans)
+    return merged.strip()
+
+
+def _merge_line_spans(blocks: List[dict]) -> List[Tuple[float, str, float]]:
+    """
+    合并页面中所有行的文字和字体，返回 (y0, merged_text, max_font_size) 列表。
+    按 y 坐标排序，同一行只返回合并后的文字。
+    使用行中最大字体作为判断依据。
+    """
+    lines_data = []
+    
+    for block in blocks:
+        if block.get('type') != 0:
+            continue
+        for line in block.get('lines', []):
+            spans = line.get('spans', [])
+            if not spans:
+                continue
+            
+            # 获取这一行所有 span 的字体，取最大值
+            font_sizes = [span.get('size', 0) for span in spans]
+            max_font_size = max(font_sizes) if font_sizes else 0
+            
+            # 合并所有 span 的文字
+            merged = _merge_adjacent_spans(line)
+            
+            if merged:
+                y0 = line.get('bbox', [0, 0, 0, 0])[1]
+                lines_data.append((y0, merged, max_font_size))
+    
+    # 按 y 坐标排序
+    lines_data.sort(key=lambda x: x[0])
+    return lines_data
+
+
+def _extract_report_title_from_first_page(page: fitz.Page) -> str:
+    """
+    从第一页提取报告标题。
+    策略：取最大字体的第一行文字。
+    """
+    try:
+        blocks = page.get_text("dict")["blocks"]
+        max_size = 0
+        title = ""
+        
+        for block in blocks:
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    text = span["text"].strip()
+                    size = span.get("size", 0)
+                    if size > max_size and len(text) >= 2:
+                        # 排除非标题内容
+                        if not any([text.startswith(x) for x in ['http', 'www', '分析日期', '发布日期']]):
+                            max_size = size
+                            title = text
+        
+        return _clean_pdf_text(title)[:60]
+    except Exception:
+        return ""
+
+
+def _extract_date_from_text(text: str) -> str:
+    """
+    从文本中提取日期。
+    """
+    date_patterns = [
+        r'(\d{4})年(\d{1,2})月(\d{1,2})日',
+        r'(\d{4})-(\d{2})-(\d{2})',
+        r'(\d{4})/(\d{2})/(\d{2})',
+        r'(\d{4})\.(\d{2})\.(\d{2})',
+    ]
+    
+    for pattern in date_patterns:
+        m = re.search(pattern, text)
+        if m:
+            return m.group(0)
+    
+    return ""
+
+
+def _extract_abstract_from_first_pages(doc: fitz.Document, max_chars: int = 300) -> str:
+    """
+    从前几页提取摘要内容。
+    策略：取 "报告摘要" 之后、正文之前的文字。
+    """
+    try:
+        # 扫描前3页
+        abstract_parts = []
+        found_abstract = False
+        
+        for page_idx in range(min(3, len(doc))):
+            page = doc[page_idx]
+            text = page.get_text()
+            
+            # 查找 "报告摘要" 标记
+            if '报告摘要' in text or '摘要' in text:
+                found_abstract = True
+            
+            if found_abstract:
+                # 提取摘要部分（直到遇到第一个章节标题）
+                lines = text.split('\n')
+                for line in lines:
+                    line = line.strip()
+                    # 遇到章节标题停止
+                    if re.match(r'^[一二三四]+[、]', line) or re.match(r'^[0-9]+[.．]', line):
+                        break
+                    if line and len(line) > 10:
+                        abstract_parts.append(line)
+        
+        abstract = ' '.join(abstract_parts)[:max_chars]
+        return _clean_pdf_text(abstract)
+    except Exception:
+        return ""
+
+
+def parse_pdf_smart(pdf_path: str, pages: Optional[str] = None) -> Tuple[ReportMeta, List[ChapterSection]]:
+    """
+    智能解析 PDF，识别报告结构。
+    
+    Returns:
+        Tuple[ReportMeta, List[ChapterSection]]: 元信息和章节列表
+    """
+    if not os.path.exists(pdf_path):
+        raise FileNotFoundError(f"PDF 文件不存在: {pdf_path}")
+    
+    doc = fitz.open(pdf_path)
+    total_pages = len(doc)
+    
+    # 获取最大字体
+    max_font = _get_doc_max_font(doc)
+    
+    # 1. 提取报告元信息
+    meta = ReportMeta(total_pages=total_pages)
+    
+    # 报告标题（第一页最大字体）
+    first_page = doc[0]
+    meta.title = _extract_report_title_from_first_page(first_page)
+    
+    # 日期（从全文提取）
+    full_text = '\n'.join(doc[i].get_text() for i in range(min(3, total_pages)))
+    meta.date = _extract_date_from_text(full_text)
+    
+    # 摘要
+    meta.abstract = _extract_abstract_from_first_pages(doc)
+    
+    # 2. 识别章节边界
+    sections: List[Dict] = []
+    current_section: Optional[Dict] = None
+    
+    for page_idx in range(total_pages):
+        page = doc[page_idx]
+        blocks = page.get_text("dict")["blocks"]
+        
+        # 使用合并后的行文字来识别章节标题
+        lines_data = _merge_line_spans(blocks)
+        
+        # 收集这一页所有章节标题
+        page_chapters = []
+        for y0, merged_text, font_size in lines_data:
+            text = merged_text.strip()
+            
+            if _is_chapter_heading(text, font_size, max_font):
+                page_chapters.append((y0, text, font_size))
+        
+        if page_chapters:
+            # 结束当前章节（如果有）
+            if current_section is not None:
+                sections.append(current_section)
+            
+            # 第一个章节作为当前章节
+            current_section = {
+                "title": _clean_pdf_text(page_chapters[0][1]),
+                "start_page": page_idx + 1,
+                "page_indices": [page_idx],
+            }
+            
+            # 同一页的其他章节标题，各自成为独立的章节
+            for i in range(1, len(page_chapters)):
+                sections.append(current_section)
+                current_section = {
+                    "title": _clean_pdf_text(page_chapters[i][1]),
+                    "start_page": page_idx + 1,
+                    "page_indices": [page_idx],
+                }
+        else:
+            # 没有章节标题，继续当前章节（如果有的话）
+            if current_section is not None:
+                current_section["page_indices"].append(page_idx)
+            else:
+                # 没有任何章节，创建一个默认章节
+                current_section = {
+                    "title": "报告正文",
+                    "start_page": page_idx + 1,
+                    "page_indices": [page_idx],
+                }
+    
+    if current_section is not None:
+        sections.append(current_section)
+    
+    # 3. 合并重复的章节标题（只保留第一个）
+    seen_titles = set()
+    merged_sections: List[Dict] = []
+    for sec in sections:
+        title = sec["title"]
+        if title in seen_titles:
+            # 合并到之前的章节
+            if merged_sections:
+                merged_sections[-1]["page_indices"].extend(sec["page_indices"])
+        else:
+            seen_titles.add(title)
+            merged_sections.append(sec)
+    
+    sections = merged_sections
+    
+    # 4. 提取每个章节的内容和图片
+    chapter_list: List[ChapterSection] = []
+    
+    for sec in sections:
+        chapter = ChapterSection(
+            title=sec["title"],
+            start_page=sec["start_page"],
+            page_indices=sec["page_indices"],
+        )
+        
+        # 提取内容和图片
+        content_parts = []
+        all_image_paths = []
+        
+        for page_idx in sec["page_indices"]:
+            page = doc[page_idx]
+            extracted_text = _extract_text_enhanced(page)
+            
+            # 如果是图表页，添加 OCR 内容
+            if _is_likely_chart_page(page):
+                ocr_text = _get_text_in_vector_regions(page)
+                if ocr_text:
+                    extracted_text = extracted_text + "\n" + ocr_text
+            
+            # 提取页面图片
+            image_paths = _extract_page_images(page, pdf_path, page_idx)
+            all_image_paths.extend(image_paths)
+            
+            content_parts.append(extracted_text)
+        
+        chapter.content = "\n\n".join(content_parts)
+        chapter.image_paths = all_image_paths
+        chapter_list.append(chapter)
+    
+    doc.close()
+    
+    return meta, chapter_list

@@ -82,9 +82,22 @@ def compose_page_clip(
     page_title: str = "",
     key_points: Optional[List[str]] = None,
     word_timestamps: Optional[List[Dict]] = None,
-    screenshot_path: Optional[str] = None,  # PDF第一页截图，显示在左侧上方
-    table_images: Optional[List[str]] = None,  # Markdown表格图片
+    screenshot_path: Optional[str] = None,  # PDF第一页截图或封面图，显示在左侧上方
+    table_images: Optional[List[str]] = None,  # Markdown表格图片（右侧展示）
+    chart_images: Optional[List[str]] = None,  # Markdown图表图片（左侧展示）
 ) -> CompositeVideoClip:
+    """
+    合成单个页面视频片段
+
+    布局设计（Markdown模式）：
+      - 左侧：图表图片（chart_images）轮播
+      - 右侧：表格图片（table_images）轮播
+      - 底部：字幕 + 进度条
+
+    布局设计（PDF模式）：
+      - 左侧：PDF截图（screenshot_path）+ 关键要点
+      - 右侧：配图（image_paths）轮播
+    """
     audio = AudioFileClip(audio_path)
     duration = audio.duration
     layers = []
@@ -95,12 +108,16 @@ def compose_page_clip(
     else:
         layers.append(_make_fallback_bg(duration))
 
-    # 2/3/5. 静态层合并：标题栏 + 左侧信息卡 + 底部字幕轻遇罩合并为一张 RGBA 底图
-    # 避免 3 个独立层在合成时逐帧做 alpha 混合
+    # 2/3/5. 静态层合并：标题栏 + 左侧信息卡 + 底部字幕轻遮罩
+    # 优先使用 chart_images 作为左侧缩略图（Markdown模式）
+    left_thumb = screenshot_path
+    if not left_thumb and chart_images:
+        left_thumb = chart_images[0] if chart_images else None
+
     title_bar_arr = _make_title_bar(page_title)
-    card_arr      = _make_info_card(page_num, page_title, key_points or [], screenshot_path)
+    card_arr      = _make_info_card(page_num, page_title, key_points or [], left_thumb)
     static_base   = Image.new("RGBA", (VW, VH), (0, 0, 0, 0))
-    # 底部字幕轻遇罩
+    # 底部字幕轻遮罩
     sub_overlay_img = Image.new("RGBA", (VW, VH), (0, 0, 0, 0))
     sub_overlay_img.paste((0, 0, 0, 55),
                           box=(0, SUB_Y0 - 20, VW, VH))
@@ -111,13 +128,18 @@ def compose_page_clip(
     static_arr  = np.array(static_base)
     layers.append(VideoClip(lambda t, a=static_arr: a, duration=duration, is_mask=False))
 
-    # 4. 右侧图表（滑入 + 轮播）
-    # 优先使用 table_images（Markdown表格），否则使用 image_paths
-    display_images = table_images if table_images else image_paths
-    if display_images:
-        chart_clip = _make_chart_clip(display_images, duration)
+    # 4. 右侧内容区域：表格图片轮播（Markdown模式）
+    if table_images:
+        chart_clip = _make_chart_clip(table_images, duration)
         if chart_clip:
             layers.append(chart_clip)
+
+    # 5. 左侧图表轮播（Markdown模式：图表放左侧，与右侧表格分开）
+    # chart_images 作为左侧缩略图时不再单独轮播（已被信息卡使用）
+    if chart_images and not screenshot_path:
+        left_chart_clip = _make_left_chart_clip(chart_images, duration)
+        if left_chart_clip:
+            layers.append(left_chart_clip)
 
     # 6. 底部打字字幕（核心动效）
     sub_clip = _make_subtitle_clip(script_text, duration, word_timestamps or [])
@@ -147,9 +169,11 @@ def compose_intro_clip(
     duration: float = 8.0,
     audio_path: Optional[str] = None,
     data_source: str = "",
+    cover_image: str = "",
 ) -> CompositeVideoClip:
     """
-    生成片头页：报告标题 + 摘要 + 分析师 + 日期 + 数据源，可选音频
+    生成片头页：居中封面图 + 标题 + 信息栏，可选音频。
+    报告摘要仅在旁白中体现，不做视觉展示。
     """
     layers = []
 
@@ -166,7 +190,7 @@ def compose_intro_clip(
 
     # 3. 片头内容（带渐入动画）
     intro_clip = _make_intro_content(
-        report_title, report_abstract, analyst, date, total_pages, duration, data_source
+        report_title, report_abstract, analyst, date, total_pages, duration, data_source, cover_image
     )
     layers.append(intro_clip)
 
@@ -690,6 +714,67 @@ def _make_chart_clip(image_paths: List[str], duration: float) -> Optional[VideoC
         return None
 
 
+def _make_left_chart_clip(image_paths: List[str], duration: float) -> Optional[VideoClip]:
+    """
+    左侧图表轮播：从左侧滑入，展示图表图片
+    用于 Markdown 模式下左侧展示章节图表
+    """
+    try:
+        charts = []
+        for path in image_paths:
+            img = Image.open(path).convert("RGBA")
+            # 左侧区域大小，避开标题栏和字幕区
+            max_h = SUB_Y0 - PAD * 3 - TITLE_BAR_H - 40
+            max_w = LEFT_W - LEFT_PAD - 30
+            img.thumbnail((max_w, max_h), Image.LANCZOS)
+            img = _card_shadow(img)
+            charts.append(np.array(img))
+
+        if not charts:
+            return None
+
+        n = len(charts)
+        time_per = duration / max(n, 1)
+        SLIDE_IN = 0.6
+        FADE_DUR = 0.4
+
+        # 左侧图表的最终位置
+        chart_x = LEFT_PAD + 20
+        chart_y = TITLE_BAR_H + TITLE_BAR_Y + 30
+
+        def make_frame(t):
+            canvas = np.zeros((VH, VW, 4), dtype=np.uint8)
+            idx = min(int(t / time_per), n - 1)
+            img_arr = charts[idx]
+            ih, iw = img_arr.shape[:2]
+
+            # 从左侧滑入
+            if t < SLIDE_IN:
+                progress = 1 - (1 - t / SLIDE_IN) ** 2
+                x = int(-iw + (chart_x + iw) * progress)
+            else:
+                x = chart_x
+
+            y = chart_y
+
+            t_in_seg = t - idx * time_per
+            alpha_scale = min(1.0, t_in_seg / FADE_DUR) if idx > 0 else 1.0
+
+            x0 = max(0, x); y0 = max(0, y)
+            x1 = min(VW, x + iw); y1 = min(VH, y + ih)
+            w = x1 - x0; h = y1 - y0
+            if w > 0 and h > 0:
+                src = img_arr[:h, :w].copy().astype(np.float32)
+                src[:, :, 3] *= alpha_scale
+                canvas[y0:y1, x0:x1] = src.astype(np.uint8)
+            return canvas
+
+        return VideoClip(make_frame, duration=duration, is_mask=False)
+    except Exception as e:
+        print(f"    [警告] 左侧图表层失败: {e}")
+        return None
+
+
 def _card_shadow(img: Image.Image, radius: int = 16, border: int = 10) -> Image.Image:
     iw, ih = img.size
     bw, bh = iw + border * 2, ih + border * 2
@@ -790,16 +875,29 @@ def _make_digital_human_clip(duration: float, page_num: int = 1) -> Optional[Vid
 
 # ── 片头页内容（淡入动画）─────────────────────────────────────────────────────
 
-def _make_intro_content(title, abstract, analyst, date, total_pages, duration, data_source="") -> VideoClip:
-    """片头内容：标题大字 + 分割线 + 摘要 + 底部信息栏，带淡入动画。
-    预计算所有静态文字宽度，避免每帧重复调用 textbbox。"""
+def _make_intro_content(title, abstract, analyst, date, total_pages, duration, data_source="", cover_image="") -> VideoClip:
+    """片头内容：居中封面大图 + 下方标题 + 底部信息栏，带淡入动画。摘要仅在旁白中体现，不做视觉展示。"""
 
-    font_title = _get_font(72)
-    font_sub   = _get_font(34)
-    font_info  = _get_font(28)
-    font_badge = _get_font(24)
+    font_title = _get_font(64)
+    font_info  = _get_font(26)
+    font_badge = _get_font(22)
 
     FADE_IN = 1.2   # 淡入时长
+
+    # ── 封面图预加载（居中展示）─────────────────────────────────────
+    cover_img = None
+    cover_arr = None
+    if cover_image and os.path.exists(cover_image):
+        try:
+            cover_img = Image.open(cover_image).convert("RGBA")
+            # 封面图居中，较大展示
+            cover_max_h = int(VH * 0.55)  # 占据上半部分
+            cover_max_w = int(VW * 0.50)  # 宽度50%
+            cover_img.thumbnail((cover_max_w, cover_max_h), Image.LANCZOS)
+            cover_arr = np.array(cover_img)
+        except Exception as e:
+            print(f"    [警告] 封面图加载失败: {e}")
+            cover_img = None
 
     # ── 预计算所有静态内容宽度 ─────────────────────────────────────
     _tmp = Image.new("RGBA", (10, 10), (0, 0, 0, 0))
@@ -812,38 +910,40 @@ def _make_intro_content(title, abstract, analyst, date, total_pages, duration, d
         except Exception:
             return len(text) * fallback_size
 
-    badge_text    = "金融报告深度解读"
-    badge_x       = VW // 2 - 130   # 固定位置
+    # 封面图尺寸（居中）
+    cover_w = 500 if cover_arr is None else cover_arr.shape[1]
+    cover_h = 350 if cover_arr is None else int(cover_w * cover_arr.shape[0] / cover_arr.shape[1])
+    cover_x = (VW - cover_w) // 2  # 水平居中
+    cover_y = 100  # 顶部留白
 
+    # 标题处理（居中，过长则换行）
     title_display = title if title else "金融分析报告"
-    if len(title_display) > 18:
-        mid    = len(title_display) // 2
-        lines  = [title_display[:mid], title_display[mid:]]
+    max_title_w = VW - PAD * 4
+    # 智能换行
+    if len(title_display) > 20:
+        mid = len(title_display) // 2
+        lines = [title_display[:mid].strip(), title_display[mid:].strip()]
     else:
-        lines  = [title_display]
-    line_tws = [_tw(l, font_title, 72) for l in lines]
-    line_txs = [(VW - tw) // 2 for tw in line_tws]
+        lines = [title_display]
 
-    abs_text = (abstract[:60] + "…" if abstract and len(abstract) > 60 else abstract or "")
-    abs_tw   = _tw(abs_text, font_sub, 34) if abs_text else 0
-    abs_tx   = (VW - abs_tw) // 2
+    # 标题居中
+    line_tws = [_tw(l, font_title, 64) for l in lines]
+    line_max_w = max(line_tws) if line_tws else 0
+    title_x = (VW - line_max_w) // 2
 
+    # 底部信息栏（居中）
     info_parts = []
     if analyst:     info_parts.append(f"分析师：{analyst}")
     if date:        info_parts.append(f"发布日期：{date}")
     if total_pages: info_parts.append(f"共 {total_pages} 页")
-    info_str  = "    |    ".join(info_parts) if info_parts else "金融研究报告"
-    info_tw   = _tw(info_str, font_info, 28)
-    info_tx   = (VW - info_tw) // 2
-    info_y    = VH - 160
+    info_str = "  |  ".join(info_parts) if info_parts else "金融研究报告"
+    info_tw  = _tw(info_str, font_info, 26)
+    info_x   = (VW - info_tw) // 2
+    info_y   = VH - 120
 
-    ds_text = f"数据来源：{data_source[:50]}" if data_source else ""
-    ds_tw   = _tw(ds_text, font_badge, 24) if ds_text else 0
-    ds_tx   = (VW - ds_tw) // 2
-
-    # y_title 起始 Y坐标（居中标题占 88px 每行）
-    title_y_start = 180
-    line_y = title_y_start + len(lines) * 88 + 10   # 分割线 Y
+    ds_text = f"数据来源：{data_source[:40]}" if data_source else ""
+    ds_tw   = _tw(ds_text, font_badge, 22) if ds_text else 0
+    ds_x    = (VW - ds_tw) // 2
 
     def make_frame(t):
         canvas = Image.new("RGBA", (VW, VH), (0, 0, 0, 0))
@@ -852,34 +952,55 @@ def _make_intro_content(title, abstract, analyst, date, total_pages, duration, d
         fade  = min(1.0, t / FADE_IN)
         alpha = int(255 * fade)
 
-        # ── 主标题 ──
-        y_title = title_y_start
-        for txt_line, tw, tx in zip(lines, line_tws, line_txs):
+        # ── 居中封面图 ──
+        if cover_arr is not None:
+            cover_resized = Image.fromarray(cover_arr).resize((cover_w, cover_h), Image.LANCZOS)
+            # 半透明深色背景卡片
+            pad = 16
+            draw.rounded_rectangle(
+                [cover_x - pad, cover_y - pad, cover_x + cover_w + pad, cover_y + cover_h + pad],
+                radius=16, fill=(10, 16, 45, int(alpha * 180))
+            )
+            # 橙色边框
+            draw.rounded_rectangle(
+                [cover_x - pad, cover_y - pad, cover_x + cover_w + pad, cover_y + cover_h + pad],
+                radius=16, fill=(*COLOR_ACCENT[:3], int(alpha * 50)), outline=(*COLOR_ACCENT[:3], int(alpha * 200)), width=2
+            )
+            canvas.paste(cover_resized, (cover_x, cover_y), cover_resized)
+
+            # 「报告封面」标签
+            lbl_font = _get_font(20)
+            lbl_w = 90
+            lbl_x = cover_x + (cover_w - lbl_w) // 2
+            draw.rounded_rectangle(
+                [lbl_x, cover_y + cover_h + 10, lbl_x + lbl_w, cover_y + cover_h + 38],
+                radius=6, fill=(*COLOR_ACCENT[:3], int(alpha * 220))
+            )
+            draw.text((lbl_x + 8, cover_y + cover_h + 14), "报告封面",
+                      fill=(255, 255, 255, alpha), font=lbl_font)
+
+        # ── 主标题（居中） ──
+        title_y = cover_y + cover_h + 80
+        for txt_line, tw in zip(lines, line_tws):
+            tx = (VW - tw) // 2
+            # 阴影
             for dx, dy in [(-2,-2),(2,-2),(-2,2),(2,2)]:
-                draw.text((tx+dx, y_title+dy), txt_line,
-                          fill=(0, 0, 0, int(alpha * 0.6)), font=font_title)
-            draw.text((tx, y_title), txt_line,
+                draw.text((tx+dx, title_y+dy), txt_line,
+                          fill=(0, 0, 0, int(alpha * 0.5)), font=font_title)
+            draw.text((tx, title_y), txt_line,
                       fill=(255, 245, 220, alpha), font=font_title)
-            y_title += 88
+            title_y += 74
 
-        # ── 橙色分割线 ──
-        draw.line([(VW // 2 - 300, line_y), (VW // 2 + 300, line_y)],
-                  fill=(*COLOR_ACCENT[:3], alpha), width=3)
-
-        # ── 摘要文字 ──
-        if abs_text:
-            draw.text((abs_tx, line_y + 30), abs_text,
-                      fill=(200, 215, 240, int(alpha * 0.9)), font=font_sub)
-
-        # ── 底部信息栏 ──
-        draw.rounded_rectangle([VW // 2 - 500, info_y - 10,
-                                 VW // 2 + 500, info_y + 110],
-                                radius=12, fill=(20, 30, 70, int(alpha * 0.8)))
-        draw.text((info_tx, info_y + 10), info_str,
+        # ── 底部信息栏（居中） ──
+        bar_w = info_tw + 60
+        bar_x = (VW - bar_w) // 2
+        draw.rounded_rectangle([bar_x, info_y - 8, bar_x + bar_w, info_y + 90],
+                               radius=12, fill=(20, 30, 70, int(alpha * 0.8)))
+        draw.text((info_x, info_y + 8), info_str,
                   fill=(200, 210, 240, int(alpha * 0.95)), font=font_info)
 
         if ds_text:
-            draw.text((ds_tx, info_y + 55), ds_text,
+            draw.text((ds_x, info_y + 50), ds_text,
                       fill=(160, 180, 220, int(alpha * 0.8)), font=font_badge)
 
         return np.array(canvas)

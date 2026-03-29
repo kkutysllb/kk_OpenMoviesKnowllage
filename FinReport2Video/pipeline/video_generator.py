@@ -83,91 +83,108 @@ def generate_intro_bg_video(
 
 def _make_futures_intro_clip(duration: float, theme: str) -> VideoClip:
     """
-    期指动态背景：
-    - 深色渐变底色（深蓝→深红戚或纯深蓝）
-    - 谷线水平网格线动效（缓慢向上移动）
-    - 纯数字流列（随机 +/- 百分比向下流动）
-    - 右下角隐约 K 线骨架
+    现代金融风格动态背景：
+    - 深色科技渐变底色（深蓝/深灰 + 紫色调）
+    - 细网格线动效（缓慢向上移动）
+    - 发光粒子效果
+    - 现代感波浪线（代替传统K线）
+    - 数字流带发光效果
     """
     # 主题配色
     if theme == "bear":
-        bg_top    = (45,  5,  5)
-        bg_bot    = (15,  3, 20)
-        grid_col  = (160, 20, 20, 35)
-        num_col   = (255, 80, 80)
-        kline_up  = (80, 160, 80)
-        kline_dn  = (220, 50, 50)
+        bg_top    = (40,  10,  20)
+        bg_bot    = (15,  5,  30)
+        grid_col  = (120, 30, 60, 20)
+        num_col   = (255, 100, 120)
+        wave_col  = (200, 80, 100)
+        glow_col  = (255, 80, 100)
     elif theme == "bull":
-        bg_top    = (5, 40, 15)
-        bg_bot    = (3, 15, 30)
-        grid_col  = (20, 160, 60, 35)
-        num_col   = (80, 255, 120)
-        kline_up  = (60, 220, 80)
-        kline_dn  = (200, 60, 60)
-    else:  # futures期指默认
-        bg_top    = (5, 12, 50)
-        bg_bot    = (3,  6, 28)
-        grid_col  = (40, 80, 200, 30)
-        num_col   = (100, 160, 255)
-        kline_up  = (80, 200, 100)
-        kline_dn  = (220, 60, 60)
+        bg_top    = (10, 50, 30)
+        bg_bot    = (5,  20, 40)
+        grid_col  = (40, 180, 100, 20)
+        num_col   = (100, 255, 150)
+        wave_col  = (80, 220, 120)
+        glow_col  = (80, 255, 150)
+    else:  # 默认现代科技风格
+        bg_top    = (15, 25, 55)
+        bg_bot    = (8,  12, 35)
+        grid_col  = (60, 100, 200, 15)
+        num_col   = (100, 180, 255)
+        wave_col  = (80, 160, 255)
+        glow_col  = (80, 140, 255)
 
-    # 预生成随机数字流列
     rng = random.Random(42)
-    NUM_STREAMS = 28
+
+    # 预生成随机数字流列（带发光效果）
+    NUM_STREAMS = 20
     streams = []
     for _ in range(NUM_STREAMS):
         x = rng.randint(0, VW - 1)
         y_start = rng.randint(-VH, 0)
-        speed = rng.uniform(40, 120)   # px/s
+        speed = rng.uniform(30, 80)
         digits = [rng.choice(["+", "-"]) +
                   f"{rng.uniform(0.1, 9.9):.2f}%"
-                  for _ in range(20)]
-        streams.append({"x": x, "y": y_start, "speed": speed,
-                        "digits": digits, "alpha": rng.uniform(0.25, 0.7)})
+                  for _ in range(25)]
+        streams.append({
+            "x": x, "y": y_start, "speed": speed,
+            "digits": digits,
+            "alpha": rng.uniform(0.3, 0.6),
+            "glow": rng.uniform(0.15, 0.3)
+        })
 
-    # 预生随机 K 线列表（右下角装饰）
-    NUM_KLINES = 18
-    klines = []
-    bar_w = 28
-    spacing = 36
-    kline_x_start = VW - (NUM_KLINES * spacing) - 60
-    kline_y_mid   = VH - 120
-    for i in range(NUM_KLINES):
-        h = rng.randint(30, 150)
-        wick = rng.randint(5, 30)
-        is_up = rng.random() > 0.45
-        klines.append({
-            "x": kline_x_start + i * spacing,
-            "y_open":  kline_y_mid + rng.randint(-60, 60),
-            "height": h, "wick": wick, "is_up": is_up
+    # 预生成波浪线控制点
+    NUM_WAVES = 5
+    waves = []
+    for i in range(NUM_WAVES):
+        waves.append({
+            "x_start": rng.randint(0, VW // 2),
+            "y_base": rng.randint(VH // 3, VH - 200),
+            "amplitude": rng.randint(30, 80),
+            "frequency": rng.uniform(0.005, 0.015),
+            "phase": rng.uniform(0, 2 * np.pi),
+            "width": rng.randint(2, 4),
+            "alpha": rng.uniform(0.2, 0.4),
+        })
+
+    # 预生成发光粒子
+    NUM_PARTICLES = 40
+    particles = []
+    for _ in range(NUM_PARTICLES):
+        particles.append({
+            "x": rng.randint(0, VW),
+            "y": rng.randint(0, VH),
+            "size": rng.uniform(1, 3),
+            "speed_x": rng.uniform(-5, 5),
+            "speed_y": rng.uniform(-15, -5),
+            "alpha": rng.uniform(0.2, 0.5),
         })
 
     from PIL import Image as PILImage, ImageDraw as PILDraw, ImageFont as PILFont
 
     try:
-        font_num = PILFont.truetype("/System/Library/Fonts/Helvetica.ttc", 16)
+        font_num = PILFont.truetype("/System/Library/Fonts/Helvetica.ttc", 14)
     except Exception:
         font_num = PILFont.load_default()
 
-    GRID_ROWS, GRID_COLS = 14, 24
-    GRID_SPEED = 18  # px/s 网格向上滖动速度
+    GRID_ROWS, GRID_COLS = 16, 28
+    GRID_SPEED = 12  # px/s 网格向上滚动速度
 
     def make_frame(t: float) -> np.ndarray:
-        # ─ 1. 渐变底色 ─
+        # ─ 1. 渐变底色（带紫色调） ─
         arr = np.zeros((VH, VW, 3), dtype=np.uint8)
         for row in range(VH):
             ratio = row / VH
             for ch in range(3):
-                arr[row, :, ch] = int(bg_top[ch] * (1 - ratio) + bg_bot[ch] * ratio)
+                val = int(bg_top[ch] * (1 - ratio) + bg_bot[ch] * ratio)
+                arr[row, :, ch] = min(255, max(0, val))
 
-        # ─ 2. 网格线（缓慢向上滖动）─
         img = PILImage.fromarray(arr, "RGB").convert("RGBA")
         draw = PILDraw.Draw(img)
 
+        # ─ 2. 细网格线（向上滚动）─
         offset_y = int(t * GRID_SPEED) % (VH // GRID_ROWS)
-        col_gap  = VW // GRID_COLS
-        row_gap  = VH // GRID_ROWS
+        col_gap = VW // GRID_COLS
+        row_gap = VH // GRID_ROWS
 
         for ci in range(GRID_COLS + 1):
             x = ci * col_gap
@@ -176,41 +193,60 @@ def _make_futures_intro_clip(duration: float, theme: str) -> VideoClip:
             y = ri * row_gap - offset_y
             draw.line([(0, y), (VW, y)], fill=grid_col, width=1)
 
-        # ─ 3. 数字流 ─
+        # ─ 3. 发光粒子 ─
+        for p in particles:
+            px = int((p["x"] + t * p["speed_x"]) % VW)
+            py = int((p["y"] + t * p["speed_y"]) % VH)
+            alpha = int(255 * p["alpha"] * (0.5 + 0.5 * np.sin(t * 2 + p["x"])))
+            # 绘制发光圆点
+            draw.ellipse([px - int(p["size"]), py - int(p["size"]),
+                         px + int(p["size"]), py + int(p["size"])],
+                        fill=(*glow_col, alpha))
+
+        # ─ 4. 现代波浪线（代替传统K线）─
+        for w in waves:
+            points = []
+            for x in range(w["x_start"], min(w["x_start"] + 400, VW), 2):
+                y = w["y_base"] + int(w["amplitude"] * np.sin(
+                    w["frequency"] * x + w["phase"] + t * 0.5))
+                if 0 <= y < VH:
+                    points.append((x, y))
+            if len(points) > 1:
+                draw.line(points, fill=(*wave_col, int(255 * w["alpha"])), width=w["width"])
+
+        # ─ 5. 数字流（带发光效果）─
         for s in streams:
-            y_pos = (s["y"] + t * s["speed"]) % (VH + 200) - 200
+            y_pos = (s["y"] + t * s["speed"]) % (VH + 300) - 200
             alpha = int(255 * s["alpha"])
+            glow_alpha = int(255 * s["glow"])
+
             for di, digit in enumerate(s["digits"]):
-                dy = y_pos + di * 22
-                if -22 < dy < VH + 22:
-                    col = (*num_col, alpha)
+                dy = y_pos + di * 20
+                if -20 < dy < VH + 20:
+                    x = s["x"]
+                    # 发光层（模糊效果通过多层叠加模拟）
                     try:
-                        draw.text((s["x"], int(dy)), digit, fill=col, font=font_num)
+                        # 外发光
+                        draw.text((x, int(dy)), digit, fill=(*glow_col, glow_alpha), font=font_num)
+                        # 主文字
+                        draw.text((x, int(dy)), digit, fill=(*num_col, alpha), font=font_num)
                     except Exception:
                         pass
 
-        # ─ 4. K 线骨架（右下角）─
-        for kl in klines:
-            color = kline_up if kl["is_up"] else kline_dn
-            x   = kl["x"]
-            y0  = kl["y_open"]
-            h   = kl["height"]
-            wk  = kl["wick"]
-            # 影线
-            draw.line([(x + bar_w // 2, y0 - wk),
-                       (x + bar_w // 2, y0 + h + wk)],
-                      fill=(*color, 160), width=2)
-            # 实体
-            draw.rectangle([x, y0, x + bar_w, y0 + h],
-                           fill=(*color, 120))
+        # ─ 6. 底部渐变光效 ─
+        for i in range(50):
+            alpha = int(255 * (1 - i / 50) * 0.3)
+            y = VH - i - 1
+            draw.rectangle([0, y, VW, y + 1], fill=(*glow_col, alpha))
 
-        # ─ 5. 全局轻微魅光渐变（周期性）─
-        pulse = 0.88 + 0.12 * np.sin(t * 0.8)
-        arr2 = np.array(img)[:, :, :3].astype(np.float32)
-        arr2 = np.clip(arr2 * pulse, 0, 255).astype(np.uint8)
-        return arr2
+        # ─ 7. 右侧垂直光带装饰 ─
+        light_x = int(VW * 0.85)
+        for i in range(VH):
+            alpha = int(255 * 0.05 * np.sin(i / VH * np.pi + t) * 0.5)
+            draw.point((light_x, i), fill=(*num_col, alpha))
+        draw.line([(light_x, 0), (light_x, VH)], fill=(*num_col, 30), width=2)
 
-    return VideoClip(make_frame, duration=duration)
+        return np.array(img)[:, :, :3]
 
 
 def _generate_minimax_video(

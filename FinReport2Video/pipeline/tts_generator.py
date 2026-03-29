@@ -11,6 +11,8 @@ import re
 import json
 import asyncio
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import wave
 import struct
 from typing import Optional, List, Dict
@@ -22,9 +24,14 @@ WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "false").lower() == "true"
 
 # ── MiniMax TTS 配置（主引擎，与 LLM 共用 Key）──────────────────────────────────
 MINIMAX_TTS_API_KEY  = os.getenv("LLM_API_KEY", "")
-MINIMAX_TTS_BASE_URL = "https://api.minimaxi.com/v1/t2a_v2"
+# API Host 需要与 Key 类型匹配：国际版用 api.minimax.io，国内版用 api.minimaxi.com
+# 自动检测：优先使用环境变量 MINIMAX_API_HOST，否则默认国内版
+MINIMAX_API_HOST = os.getenv("MINIMAX_API_HOST", "https://api.minimaxi.com")
+MINIMAX_TTS_BASE_URL = f"{MINIMAX_API_HOST}/v1/t2a_v2"
 MINIMAX_TTS_MODEL    = "speech-2.8-hd"
 MINIMAX_TTS_VOICE_ID = "female-shaonv"   # 女声，活泼自然；可选: male-qn-qingse(男)、female-yujie(女）
+# SSL 验证：生产环境建议保持 True，若遇 SSL 错误可临时设为 False
+MINIMAX_TTS_VERIFY_SSL = os.getenv("MINIMAX_TTS_VERIFY_SSL", "true").lower() != "false"
 
 # ── Qwen TTS 备用（已降级，保留兼容）────────────────────────────────────
 QWEN_TTS_API_KEY = os.getenv("QWEN_API_KEY", "")
@@ -335,6 +342,22 @@ def load_word_timestamps(page_num: int, pdf_name: str, temp_dir: str = "temp") -
 
 # ── MiniMax TTS ───────────────────────────────────────────────────────────────
 
+def _create_session_with_retry(retries: int = 3, backoff_factor: float = 0.5) -> requests.Session:
+    """创建带有重试机制的 requests Session"""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["POST"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
 def _generate_minimax_tts(text: str) -> Optional[bytes]:
     """调用 MiniMax speech-2.8-hd 同步 HTTP TTS，返回 MP3 bytes 或 None"""
     try:
@@ -361,9 +384,14 @@ def _generate_minimax_tts(text: str) -> Optional[bytes]:
             "output_format": "hex",
             "language_boost": "Chinese",
         }
-        resp = requests.post(
-            MINIMAX_TTS_BASE_URL, json=payload, headers=headers, timeout=60
+        # 使用带重试机制的 Session
+        session = _create_session_with_retry(retries=3, backoff_factor=0.5)
+        resp = session.post(
+            MINIMAX_TTS_BASE_URL, json=payload, headers=headers,
+            timeout=(10, 60), verify=MINIMAX_TTS_VERIFY_SSL
         )
+        session.close()
+
         if not resp.ok:
             print(f"    [MiniMax TTS] API 错误: {resp.status_code} {resp.text[:200]}")
             return None
@@ -379,6 +407,9 @@ def _generate_minimax_tts(text: str) -> Optional[bytes]:
             print(f"    [MiniMax TTS] 响应中无音频数据: {str(data)[:200]}")
             return None
         return bytes.fromhex(audio_hex)
+    except requests.exceptions.SSLError as e:
+        print(f"    [MiniMax TTS] SSL 错误（尝试设置 MINIMAX_TTS_VERIFY_SSL=false）: {e}")
+        return None
     except Exception as e:
         print(f"    [MiniMax TTS] 异常: {e}")
         return None
