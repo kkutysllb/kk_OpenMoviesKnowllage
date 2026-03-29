@@ -11,7 +11,7 @@
 
 ### 项目简介
 
-将金融研报 PDF 全自动转换为带语音讲解的 1080p MP4 视频。核心流程：PDF 解析 → LLM 润色讲稿 → edge-tts 语音合成 → 本地动效背景生成 → moviepy 合成输出。
+将金融研报 Markdown 文件全自动转换为带语音讲解的 1080p MP4 视频。核心流程：Markdown 解析 → LLM 润色讲稿 → edge-tts 语音合成 → 本地动效背景生成 → moviepy 合成输出。
 
 ```
 FinReport2Video/
@@ -21,19 +21,19 @@ FinReport2Video/
 ├── requirements.txt
 ├── start_web.sh         # 一键启动脚本
 ├── .env                 # 敏感配置（不提交 Git）
-├── input/               # Web 上传 PDF 存放目录
+├── input/               # Web 上传 Markdown 存放目录
 ├── output/              # 生成视频输出目录
 ├── temp/                # 中间文件缓存
 ├── web/                 # Next.js 前端
 │   ├── app/page.tsx     # 主页面（拖拽上传 + 任务卡片 + 播放器）
 │   └── app/api/py/      # 反向代理（→ FastAPI:8765）
 └── pipeline/
-    ├── pdf_parser.py    # PDF 解析、章节分页、元信息提取
+    ├── markdown_parser.py  # Markdown 解析、按标题分章节、元信息提取
     ├── script_writer.py # LLM 讲稿润色
     ├── tts_generator.py # 语音合成（edge-tts 主 / Qwen TTS 备用）
     ├── video_generator.py   # 本地背景生成（Ken Burns 动效 + 片头专用）
     ├── video_composer.py    # 视频合成（字幕、信息卡片、交叉淡化转场）
-    ├── image_fetcher.py     # PDF 原图提取 / AI 配图
+    ├── image_fetcher.py     # AI 配图
     └── prompt_builder.py    # 视频 prompt 构建
 ```
 
@@ -41,14 +41,14 @@ FinReport2Video/
 
 | 功能 | 说明 |
 |------|------|
-| PDF 解析 | PyMuPDF 按大标题自动分章节，提取文字、图片、截图 |
-| 元信息提取 | 扫描前 2 页 + 末 3 页，提取标题、摘要、分析师、日期、数据来源 |
+| Markdown 解析 | 按 `#` 标题自动分章节，提取文字、表格、图片 |
+| 元信息提取 | 从 frontmatter 或正文提取标题、日期、作者、数据来源 |
 | LLM 润色 | DeepSeek 将原文改写为适合播报的讲稿（可 `--skip-llm` 跳过）|
 | 语音合成 | edge-tts（免费）主力，Qwen TTS 备用；支持逐字时间戳驱动字幕 |
 | 背景视频 | 本地生成 Ken Burns 镜头推拉 + 片头专用期指 K 线动效（零 API 费用）|
-| 视频合成 | 1080p，顶部章节标题栏、关键信息浮动卡片、底部字幕、0.5s 交叉淡化转场 |
-| 片头页 | 报告标题 + 摘要 + 分析师 + 日期 + 数据来源 + 动态背景，时长跟随音频 |
-| Web UI | 深色金融风界面，拖拽上传 PDF，实时查看进度日志，内嵌播放 / 下载 |
+| 视频合成 | 1080p，左侧图表轮播 + 右侧表格轮播 + 底部字幕、0.5s 交叉淡化转场 |
+| 片头页 | 居中封面图 + 标题 + 分析师 + 日期 + 数据来源 + 动态背景，时长跟随音频 |
+| Web UI | 深色金融风界面，拖拽上传 Markdown，实时查看进度日志，内嵌播放 / 下载 |
 
 ### 快速开始
 
@@ -64,7 +64,7 @@ pip install -r requirements.txt
 cp .env.example .env   # 编辑 .env，写入 API Key
 
 # CLI 模式
-python main.py --input /path/to/report.pdf
+python main.py --input /path/to/report.md
 
 # Web UI 模式（浏览器访问 http://localhost:3000）
 bash start_web.sh
@@ -73,10 +73,9 @@ bash start_web.sh
 **CLI 常用参数：**
 
 ```bash
-python main.py --input report.pdf              # 默认：LLM润色 + AI配图
-python main.py --input report.pdf --skip-llm  # 快速模式：跳过 LLM
-python main.py --input report.pdf --pages 1-5  # 只处理前5页
-python main.py --list-voices                   # 查看可用音色
+python main.py --input report.md              # 默认：LLM润色 + AI配图
+python main.py --input report.md --skip-llm  # 快速模式：跳过 LLM
+python main.py --list-voices                  # 查看可用音色
 ```
 
 ### 配置说明（.env）

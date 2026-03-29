@@ -79,13 +79,9 @@ def get_digital_human_videos() -> list:
             videos.append(os.path.join(DIGITAL_HUMAN_DIR, f))
     return videos
 
-# ── PDF 解析 ──────────────────────────────────────────────────────────────────
-PDF_DPI = 150                          # 页面截图分辨率
-PDF_MIN_IMAGE_SIZE = 500               # 忽略小于此像素数的图片（原5000降低，保留更多小图标）
-
 # ── LLM 讲稿 ─────────────────────────────────────────────────────────────────
-SCRIPT_MIN_CHARS = 1000                # 讲稿最少字数
-SCRIPT_MAX_CHARS = 5000                # 讲稿最多字数
+SCRIPT_MIN_CHARS = 1000                # 讲稿最少字数（确保内容充实）
+SCRIPT_MAX_CHARS = 8000                # 讲稿最多字数（防止截断）
 
 # ── 字幕 ──────────────────────────────────────────────────────────────────────
 SUBTITLE_FONT_SIZE = 32

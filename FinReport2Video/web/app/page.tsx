@@ -382,7 +382,7 @@ function TaskCard({ task, onRefresh, onCancel }: { task: Task; onRefresh: () => 
   }
 
   const handleCleanup = async () => {
-    if (!confirm('确定要清理该任务的临时资源吗？\n\n将删除：\n• input/ 中的原始 PDF 文件\n• temp/ 中的临时处理文件（截图、音频、讲稿缓存等）\n\n生成的视频文件不会删除。')) return
+    if (!confirm('确定要清理该任务的临时资源吗？\n\n将删除：\n• input/ 中的原始 Markdown 文件\n• temp/ 中的临时处理文件（截图、音频、讲稿缓存等）\n\n生成的视频文件不会删除。')) return
     setCleaning(true)
     try {
       const res = await fetch(API(`task/${task.task_id}`), { method: 'DELETE' })
@@ -721,7 +721,7 @@ function UploadZone({ onSubmit, uploading }: {
     e.preventDefault()
     setDragging(false)
     const f = e.dataTransfer.files[0]
-    if (f && (f.name.endsWith('.pdf') || f.name.endsWith('.md'))) setFile(f)
+    if (f && (f.name.endsWith('.md') || f.name.endsWith('.markdown'))) setFile(f)
   }, [])
 
   const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -751,7 +751,7 @@ function UploadZone({ onSubmit, uploading }: {
         <input
           ref={inputRef}
           type="file"
-          accept=".pdf,.md"
+          accept=".md,.markdown"
           className="hidden"
           onChange={handleFile}
         />
@@ -785,8 +785,8 @@ function UploadZone({ onSubmit, uploading }: {
                 <line x1="12" y1="3" x2="12" y2="15"/>
               </svg>
             </div>
-            <p className="text-sm text-slate-300 font-medium">拖拽 PDF 或 Markdown 到此处，或点击选择</p>
-            <p className="text-xs text-slate-500 mt-1">支持金融研报、分析报告等 PDF 或 Markdown 文件</p>
+            <p className="text-sm text-slate-300 font-medium">拖拽 Markdown 文件到此处，或点击选择</p>
+            <p className="text-xs text-slate-500 mt-1">支持金融研报、分析报告等 Markdown 文件</p>
           </div>
         )}
       </div>
@@ -895,7 +895,7 @@ export default function Home() {
     }
   }, [refreshTasks, tasks])
 
-  // 第一步：上传并解析 PDF 章节
+  // 第一步：上传并解析 Markdown 章节
   const handleSubmit = async (file: File, skipLlm: boolean, pages: string) => {
     setUploading(true)
     setError(null)
@@ -1017,7 +1017,7 @@ export default function Home() {
         <section>
           <div className="mb-4">
             <h2 className="text-lg font-semibold text-slate-100">上传金融报告</h2>
-            <p className="text-sm text-slate-500 mt-0.5">支持 PDF 或 Markdown 格式，自动解析并生成带语音讲解的视频</p>
+            <p className="text-sm text-slate-500 mt-0.5">支持 Markdown 格式，自动解析并生成带语音讲解的视频</p>
           </div>
           <div className="bg-slate-800/40 border border-slate-700/60 rounded-2xl p-6">
             <UploadZone onSubmit={handleSubmit} uploading={uploading} />
@@ -1065,7 +1065,7 @@ export default function Home() {
               <polygon points="23 7 16 12 23 17 23 7"/>
               <rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
             </svg>
-            <p className="text-sm">上传 PDF 后，生成记录将在此显示</p>
+            <p className="text-sm">上传 Markdown 后，生成记录将在此显示</p>
           </div>
         )}
       </main>

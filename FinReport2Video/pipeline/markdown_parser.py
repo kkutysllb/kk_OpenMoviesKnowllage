@@ -17,6 +17,18 @@ import tempfile
 # 图片存储根目录（kkStockClaw 项目）
 IMAGE_BASE_DIR = "/Users/libing/kk_Claw/kkStockClaw"
 
+# ── 数据结构（兼容旧版 PDF 解析）────────────────────────────────────────────────
+
+@dataclass
+class PageData:
+    """页面数据结构"""
+    page_num: int            # 页码（从1开始）
+    text: str                # 提取的纯文字内容
+    screenshot_path: str     # 页面截图路径
+    image_paths: List[str] = field(default_factory=list)  # 页内图片路径列表
+    title: str = ""          # 页面推断标题（首行文字）
+    key_points: List[str] = field(default_factory=list)   # 页面关键信息点
+
 # 报告类型中文名到目录名的映射
 REPORT_TYPE_MAPPING = {
     "日度市场分析": "DailyMarketReport",
@@ -30,6 +42,8 @@ REPORT_TYPE_MAPPING = {
     "宏观": "MacroReport",
     "周度市场": "WeeklyMarketReport",
     "财务报告": "FinancialReport",
+    "财报分析": "FinancialReport",
+    "财报": "FinancialReport",
     "全球市场": "GlobalMarketReport",
     "行业分析": "IndustryReport",
 }
@@ -93,10 +107,10 @@ def parse_markdown(md_path: str) -> Tuple[MarkdownMetadata, List[MarkdownSection
     
     # ── 提取文档元数据 ────────────────────────────────────────────────────────
     metadata = _extract_metadata(content, md_dir)
-    
-    # ── 按 ## 标题分割章节 ────────────────────────────────────────────────────
-    # 匹配 ## 标题行
-    pattern = r'(^|\n)##\s+(.+?)(?=\n##\s+|\Z)'
+
+    # ── 按 ## 或 ### 标题分割章节 ────────────────────────────────────────────────────
+    # 匹配 ## 和 ### 标题行，统一作为章节处理
+    pattern = r'(^|\n)(#{2,3})\s+(.+?)(?=\n#{2,3}\s+|\Z)'
     matches = list(re.finditer(pattern, content, re.DOTALL))
 
     sections = []
@@ -108,7 +122,8 @@ def parse_markdown(md_path: str) -> Tuple[MarkdownMetadata, List[MarkdownSection
         # 提取标题（第一行）
         lines = section_text.split('\n')
         title_line = lines[0]
-        title = re.sub(r'^##\s*', '', title_line).strip()
+        heading_level = len(match.group(2))  # ## 或 ###
+        title = re.sub(r'^#{2,3}\s*', '', title_line).strip()
 
         # 清理标题中的 emoji（与主标题一致的处理方式）
         title_clean = re.sub(r'^[\U0001F300-\U0001F9FF]\s*', '', title)
@@ -135,7 +150,7 @@ def parse_markdown(md_path: str) -> Tuple[MarkdownMetadata, List[MarkdownSection
             tables=tables,
             images=images,
             order=len(sections) + 1,
-            level=2
+            level=heading_level
         )
         sections.append(section)
     
@@ -591,30 +606,31 @@ def render_section_tables(section: MarkdownSection, output_dir: str) -> List[str
 def _extract_report_type(md_path: str) -> Tuple[str, str]:
     """
     从 Markdown 文件名提取报告类型
-    
-    文件名格式示例: 1774617335_日度市场分析_20260327_2026-03-27_2017.md
-    提取 "日度市场分析" 并映射到对应目录名
-    
+
+    文件名格式示例:
+    - 1774617335_日度市场分析_20260327_2026-03-27_2017.md
+    - 比亚迪_002594_SZ_财报分析报告_2026-03-29.md
+    - 期货分析_螺纹钢_20260327.md
+
     Returns:
         (报告类型中文名, 报告目录名)
     """
     filename = os.path.basename(md_path)
     # 移除扩展名
     name_no_ext = os.path.splitext(filename)[0]
-    
-    # 尝试从文件名中提取报告类型（第二个下划线分隔的部分）
+
+    # 优先从文件名中搜索已知的报告类型关键词
+    for cn_name, en_name in REPORT_TYPE_MAPPING.items():
+        if cn_name in name_no_ext:
+            return cn_name, en_name
+
+    # 回退：从下划线分隔的部分中找匹配
     parts = name_no_ext.split('_')
-    if len(parts) >= 2:
-        report_type_cn = parts[1]
-        # 映射到目录名
+    for part in parts:
         for cn_name, en_name in REPORT_TYPE_MAPPING.items():
-            if cn_name in report_type_cn or report_type_cn in cn_name:
-                return report_type_cn, en_name
-        # 如果没有精确匹配，尝试部分匹配
-        for cn_name, en_name in REPORT_TYPE_MAPPING.items():
-            if cn_name in report_type_cn:
-                return report_type_cn, en_name
-    
+            if cn_name in part or part in cn_name:
+                return cn_name, en_name
+
     # 默认返回 DailyMarketReport
     return "日度市场分析", "DailyMarketReport"
 
@@ -754,18 +770,18 @@ def _copy_cover_image(cover_path: str, output_dir: str, md_dir: str, image_sourc
     return ""
 
 
-# 兼容 PDF 解析的数据结构
+# 页面数据结构转换
 def convert_to_page_data(
-    sections: List[MarkdownSection], 
+    sections: List[MarkdownSection],
     temp_dir: str,
     md_name: str,
     md_path: str = "",
     cover_image: str = "",
     md_dir: str = ""
-) -> List:
+) -> List[PageData]:
     """
-    将 MarkdownSection 转换为兼容 PageData 的结构
-    
+    将 MarkdownSection 转换为 PageData 结构
+
     Args:
         sections: Markdown 章节列表
         temp_dir: 临时目录根目录（如 ./temp/）
@@ -777,8 +793,7 @@ def convert_to_page_data(
     Returns:
         兼容 PageData 的列表
     """
-    from pipeline.pdf_parser import PageData
-    
+
     # 创建文档专属子目录
     doc_temp_dir = os.path.join(temp_dir, md_name)
     tables_dir = os.path.join(doc_temp_dir, "tables")
