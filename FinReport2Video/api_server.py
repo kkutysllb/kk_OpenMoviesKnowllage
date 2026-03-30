@@ -638,7 +638,6 @@ def _run_markdown_generation(task_id: str, md_path: str, skip_llm: bool):
             os.path.join(BASE_DIR, "main.py"),
             "--input", md_path,
             "--output", output_path,
-            "--format", "markdown",
         ]
         if skip_llm:
             cmd.append("--skip-llm")

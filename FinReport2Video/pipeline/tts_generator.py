@@ -205,16 +205,22 @@ def generate_audio(
 
     # 1. 记录 LLM 標记的断行位置，再清洗文本
     # LLM 在讲稿里用 \n 表示字幕断行位置，需要先记录再删除
+    # 注意：先规范化多余换行（与 write_script 中的 _clean_markdown 保持一致）
+    text_norm = re.sub(r'\n{2,}', '\n', text)  # 双换行 → 单换行（与 _clean_markdown 一致）
     newline_positions: List[int] = []  # 在原始文本中的 \n 位置
     stripped_text = ''                  # 删除 \n 后的文本（用于对比时间戳）
-    for ch in text:
+    for ch in text_norm:
         if ch == '\n':
             newline_positions.append(len(stripped_text))  # 记在当前位置之后
         else:
             stripped_text += ch
 
-    # 清洗文本（此时清洗已不含 \n）
-    clean_text = _clean_tts_text(stripped_text)
+    # 清洗文本（保持单换行结构，让 _clean_tts_text 进行行合并）
+    # text_norm 已有单换行，_clean_tts_text 会按 \n 分行后合并（与 write_script 行为一致）
+    clean_text = _clean_tts_text(text_norm)
+    # 数字TTS友好转换（百分比等），确保与字幕显示文本一致
+    from pipeline.script_writer import normalize_numbers_for_tts
+    clean_text = normalize_numbers_for_tts(clean_text)
     if not clean_text:
         print(f"    [警告] 清洗后文本为空，使用静音占位")
         _create_silent_audio(output_path, duration=5)
